@@ -23,7 +23,7 @@ BASE_URL = "https://cdn.freesound.org/mtg-jamendo"
 
 BASE_PATH = Path(__file__).parent
 ASSETS_DIR = BASE_PATH / "../assets"
-OUTPUT_DIR = BASE_PATH / "../data/audio"
+OUTPUT_DIR = BASE_PATH / "../data/audio/mp3"
 
 SHA256_TARS_FILE = ASSETS_DIR / "raw_30s_audio-low_sha256_tars.txt"
 SHA256_TRACKS_FILE = ASSETS_DIR / "raw_30s_audio-low_sha256_tracks.txt"
