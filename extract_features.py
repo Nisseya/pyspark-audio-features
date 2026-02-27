@@ -3,7 +3,7 @@ print(os.getcwd())
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf
-from pyspark.sql.types import StructType, StructField, DoubleType
+from pyspark.sql.types import StructType, StructField, ArrayType, DoubleType
 import librosa
 import numpy as np
 
@@ -17,136 +17,101 @@ df = spark.createDataFrame(data, ["path"])
 
 
 # =========================
-# Schema dynamique
+# Schema : chaque feature = tableau
 # =========================
 
-feature_fields = []
+schema = StructType([
 
-# MFCC 20 mean + 20 std
-for i in range(20):
-    feature_fields.append(StructField(f"mfcc_{i+1}_mean", DoubleType()))
-for i in range(20):
-    feature_fields.append(StructField(f"mfcc_{i+1}_std", DoubleType()))
+    # MFCC (20 coefficients)
+    *[StructField(f"mfcc_{i+1}", ArrayType(DoubleType())) for i in range(20)],
 
-# Spectral features
-feature_fields += [
-    StructField("centroid_mean", DoubleType()),
-    StructField("centroid_std", DoubleType()),
-    StructField("bandwidth_mean", DoubleType()),
-    StructField("bandwidth_std", DoubleType()),
-    StructField("rolloff_mean", DoubleType()),
-    StructField("rolloff_std", DoubleType()),
-    StructField("flatness_mean", DoubleType()),
-    StructField("flatness_std", DoubleType()),
-]
+    # Spectral features
+    StructField("spectral_centroid", ArrayType(DoubleType())),
+    StructField("spectral_bandwidth", ArrayType(DoubleType())),
+    StructField("spectral_rolloff", ArrayType(DoubleType())),
+    StructField("spectral_flatness", ArrayType(DoubleType())),
 
-# Spectral contrast (7 bandes par défaut)
-for i in range(7):
-    feature_fields.append(StructField(f"contrast_{i+1}_mean", DoubleType()))
-for i in range(7):
-    feature_fields.append(StructField(f"contrast_{i+1}_std", DoubleType()))
+    # Spectral contrast (7 bandes)
+    *[StructField(f"spectral_contrast_{i+1}", ArrayType(DoubleType())) for i in range(7)],
 
-# Tempo + Onset
-feature_fields += [
-    StructField("tempo", DoubleType()),
-    StructField("onset_mean", DoubleType()),
-    StructField("onset_std", DoubleType()),
-]
+    # Rythme
+    StructField("tempo", DoubleType()),  # tempo reste scalaire
+    StructField("onset_strength", ArrayType(DoubleType())),
 
-# Chroma (12)
-for i in range(12):
-    feature_fields.append(StructField(f"chroma_{i+1}_mean", DoubleType()))
-for i in range(12):
-    feature_fields.append(StructField(f"chroma_{i+1}_std", DoubleType()))
+    # Harmonie
+    *[StructField(f"chroma_{i+1}", ArrayType(DoubleType())) for i in range(12)],
 
-# Tonnetz (6)
-for i in range(6):
-    feature_fields.append(StructField(f"tonnetz_{i+1}_mean", DoubleType()))
-for i in range(6):
-    feature_fields.append(StructField(f"tonnetz_{i+1}_std", DoubleType()))
+    *[StructField(f"tonnetz_{i+1}", ArrayType(DoubleType())) for i in range(6)],
 
-# RMS + ZCR
-feature_fields += [
-    StructField("rms_mean", DoubleType()),
-    StructField("rms_std", DoubleType()),
-    StructField("zcr_mean", DoubleType()),
-    StructField("zcr_std", DoubleType()),
-]
-
-schema = StructType(feature_fields)
+    # Dynamique
+    StructField("rms", ArrayType(DoubleType())),
+    StructField("zcr", ArrayType(DoubleType())),
+])
 
 
 # =========================
-# Feature extraction
+# Extraction
 # =========================
 
 def extract_features(path):
     try:
         y, sr = librosa.load(path, sr=None)
+
         values = []
 
         # MFCC
         mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-        values.extend(np.mean(mfcc, axis=1))
-        values.extend(np.std(mfcc, axis=1))
+        for i in range(20):
+            values.append(mfcc[i, :].tolist())
 
-        # Spectral features
-        centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
-        bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)
-        rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
-        flatness = librosa.feature.spectral_flatness(y=y)
-
-        values += [
-            np.mean(centroid), np.std(centroid),
-            np.mean(bandwidth), np.std(bandwidth),
-            np.mean(rolloff), np.std(rolloff),
-            np.mean(flatness), np.std(flatness),
-        ]
+        # Spectral
+        values.append(librosa.feature.spectral_centroid(y=y, sr=sr)[0].tolist())
+        values.append(librosa.feature.spectral_bandwidth(y=y, sr=sr)[0].tolist())
+        values.append(librosa.feature.spectral_rolloff(y=y, sr=sr)[0].tolist())
+        values.append(librosa.feature.spectral_flatness(y=y)[0].tolist())
 
         # Spectral contrast
         contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
-        values.extend(np.mean(contrast, axis=1))
-        values.extend(np.std(contrast, axis=1))
+        for i in range(7):
+            values.append(contrast[i, :].tolist())
 
-        # Tempo & onset
+        # Tempo
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        values.append(float(tempo))
 
-        values += [
-            float(tempo),
-            np.mean(onset_env),
-            np.std(onset_env),
-        ]
+        # Onset strength
+        onset = librosa.onset.onset_strength(y=y, sr=sr)
+        values.append(onset.tolist())
 
         # Chroma
         chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-        values.extend(np.mean(chroma, axis=1))
-        values.extend(np.std(chroma, axis=1))
+        for i in range(12):
+            values.append(chroma[i, :].tolist())
 
         # Tonnetz
         y_harm = librosa.effects.harmonic(y)
         tonnetz = librosa.feature.tonnetz(y=y_harm, sr=sr)
-        values.extend(np.mean(tonnetz, axis=1))
-        values.extend(np.std(tonnetz, axis=1))
+        for i in range(6):
+            values.append(tonnetz[i, :].tolist())
 
-        # RMS + ZCR
-        rms = librosa.feature.rms(y=y)
-        zcr = librosa.feature.zero_crossing_rate(y)
+        # RMS
+        values.append(librosa.feature.rms(y=y)[0].tolist())
 
-        values += [
-            np.mean(rms), np.std(rms),
-            np.mean(zcr), np.std(zcr),
-        ]
+        # ZCR
+        values.append(librosa.feature.zero_crossing_rate(y)[0].tolist())
 
-        return tuple(float(v) for v in values)
+        return tuple(values)
 
     except Exception as e:
         print("Erreur:", e)
-        return tuple([0.0] * len(feature_fields))
+        return tuple([[] for _ in range(len(schema))])
 
 
 extract_udf = udf(extract_features, schema)
 
-df_features = df.select("path", extract_udf("path").alias("features")).select("path", "features.*")
+df_features = df.select(
+    "path",
+    extract_udf("path").alias("features")
+).select("path", "features.*")
 
 df_features.show(truncate=False)
