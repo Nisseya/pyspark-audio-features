@@ -26,18 +26,7 @@ spark.sparkContext.setLogLevel("ERROR")
 # =========================
 # Helpers : stats compactes
 # =========================
-def _stats_1d(x):
-    x = np.asarray(x, dtype=np.float64).reshape(-1)
-    if x.size == 0:
-        return 0.0, 0.0, 0.0, 0.0
-    return float(x.mean()), float(x.std()), float(x.min()), float(x.max())
-
-def _stats_2d_rows(M, n_rows):
-    M = np.asarray(M, dtype=np.float64)
-    out = []
-    for i in range(n_rows):
-        out.extend(_stats_1d(M[i, :]))
-    return out
+from utils.features import _stats_1d, _stats_2d_rows
 
 # =========================
 # Schéma compact : scalaires
@@ -194,7 +183,7 @@ ok_total = 0
 ko_total = 0
 
 for bid in tqdm(batch_ids, desc="Batches", unit="batch"):
-    batch = paths_df.filter(col("batch_id") == lit(bid)).repartition(8)e
+    batch = paths_df.filter(col("batch_id") == lit(bid)).repartition(8)
     if batch.rdd.isEmpty():
         continue
 
@@ -225,6 +214,8 @@ for bid in tqdm(batch_ids, desc="Batches", unit="batch"):
     )
 
     tqdm.write(f"batch={bid} ok={ok_b} ko={ko_b} | cumul ok={ok_total} ko={ko_total}")
+
+
 
 print("DONE | OK:", ok_total, "KO:", ko_total)
 spark.stop()
