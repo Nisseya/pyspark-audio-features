@@ -55,15 +55,17 @@ def get_spark():
 def load_data():
     """Charge et agrège les données depuis le dataset Parquet via Spark."""
     spark    = get_spark()
-    out_path = "data/features/training_dataset"
+    out_path = "./data/features_training_dataset_dataset.parquet"
     df       = spark.read.parquet(out_path)
 
     total_tracks = df.count()
 
     has_duration = "duration" in df.columns
+    genre_col = "genre" if "genre" in df.columns else "genres"
+
     agg_base = [
         F.round(F.mean("tempo"), 1).alias("tempo_mean"),
-        F.countDistinct("genres").alias("n_genres"),
+        F.countDistinct(genre_col).alias("n_genres"),
     ]
     if has_duration:
         agg_base.append(F.round(F.mean("duration"), 1).alias("duration_avg"))
@@ -72,17 +74,18 @@ def load_data():
     global_stats = global_stats_pdf.iloc[0]
     duration_avg = float(global_stats["duration_avg"] or 0) if has_duration else None
 
-    df_genres = df.withColumn("genres", F.explode(F.col("genres")))
+    if genre_col == "genres":
+        df = df.withColumn("genres", F.explode(F.col("genres")))
+    else:
+        df = df.withColumnRenamed("genre", "genres")
 
     genres_df = (
-        df_genres.groupBy("genres").count()
+        df.groupBy("genres").count()
         .orderBy("count", ascending=False)
         .limit(12)
         .toPandas()
     )
     genres_df["pct"] = (genres_df["count"] / total_tracks * 100).round(1)
-
-    df = df_genres
 
     tempo_buckets = _build_tempo_buckets(df)
     stats_by_genre = _build_stats_by_genre(df)
@@ -134,20 +137,23 @@ def _build_tempo_buckets(df):
 
 
 def _build_stats_by_genre(df):
+    agg_exprs = [
+        F.round(F.mean("tempo"), 1).alias("tempo"),
+        F.round(F.mean("centroid_mean"), 0).alias("centroid"),
+        F.round(F.mean("rms_mean"), 4).alias("rms"),
+        F.round(F.mean("zcr_mean"), 4).alias("zcr"),
+        F.round(F.mean("flatness_mean"), 5).alias("flatness"),
+        F.round(F.mean("mfcc_1_mean"), 2).alias("mfcc1"),
+        F.round(F.mean("mfcc_2_mean"), 2).alias("mfcc2"),
+        F.round(F.mean("mfcc_3_mean"), 2).alias("mfcc3"),
+        F.round(F.mean("mfcc_4_mean"), 2).alias("mfcc4"),
+        F.round(F.mean("mfcc_5_mean"), 2).alias("mfcc5"),
+        F.count("*").alias("count"),
+    ]
+    if "duration" in df.columns:
+        agg_exprs.append(F.round(F.mean("duration"), 1).alias("duration_avg"))
     return (
-        df.groupBy("genres").agg(
-            F.round(F.mean("tempo"), 1).alias("tempo"),
-            F.round(F.mean("centroid_mean"), 0).alias("centroid"),
-            F.round(F.mean("rms_mean"), 4).alias("rms"),
-            F.round(F.mean("zcr_mean"), 4).alias("zcr"),
-            F.round(F.mean("flatness_mean"), 5).alias("flatness"),
-            F.round(F.mean("mfcc_1_mean"), 2).alias("mfcc1"),
-            F.round(F.mean("mfcc_2_mean"), 2).alias("mfcc2"),
-            F.round(F.mean("mfcc_3_mean"), 2).alias("mfcc3"),
-            F.round(F.mean("mfcc_4_mean"), 2).alias("mfcc4"),
-            F.round(F.mean("mfcc_5_mean"), 2).alias("mfcc5"),
-            F.count("*").alias("count"),
-        )
+        df.groupBy("genres").agg(*agg_exprs)
         .orderBy("count", ascending=False)
         .limit(12)
         .toPandas()
@@ -542,7 +548,7 @@ def _input_youtube():
     return None, None
 
 def _render_history_section(d):
-    st.header("🎵 Historique des musiques téléchargées")
+    st.header("Historique des musiques téléchargées")
     history_path = "data/features/history_features"
     spark = get_spark()
 

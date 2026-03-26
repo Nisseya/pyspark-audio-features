@@ -3,3 +3,4 @@ data/audio/*
 */__pycache__
 .env
 data/features/history_features
+data/model/

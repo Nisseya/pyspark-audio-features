@@ -10,16 +10,16 @@ if os.getenv("CESTQUIQUIADESPROBLEMESAVECSPARK") == "Leo":
     os.environ["HADOOP_HOME"] = r"C:\hadoop"
     os.environ["PATH"] = r"C:\hadoop\bin;" + os.environ["PATH"]
 
-# _hadoop_home = os.getenv("HADOOP_HOME")
-# if _hadoop_home:
-#     os.environ["PATH"] = _hadoop_home + r"\bin;" + os.environ.get("PATH", "")
-# os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
-# os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+_hadoop_home = os.getenv("HADOOP_HOME")
+if _hadoop_home:
+    os.environ["PATH"] = _hadoop_home + r"\bin;" + os.environ.get("PATH", "")
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, size, element_at
+from pyspark.sql.functions import col
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import StringIndexer, VectorAssembler
 from pyspark.ml.classification import RandomForestClassifier
@@ -36,16 +36,16 @@ spark = (
 )
 spark.sparkContext.setLogLevel("ERROR")
 
-df = spark.read.parquet(os.path.join(PROJECT_ROOT, "data/features/training_dataset"))
+df = spark.read.parquet("./data/features_training_dataset_dataset.parquet")
 
 df = (
     df
-    .filter(col("genres").isNotNull())
-    .filter(size(col("genres")) > 0)
-    .withColumn("label_str", element_at(col("genres"), 1))
+    .filter(col("genre").isNotNull())
+    .filter(col("genre") != "")
+    .withColumn("label_str", col("genre"))
 )
 
-excluded = {"path", "TRACK_ID", "meta_path", "genres", "label_str", "track_num", "batch_id"}
+excluded = {"path", "filename", "TRACK_ID", "meta_path", "genres", "genre", "label_str", "track_num", "batch_id", "duration"}
 feature_cols = [
     name for name, dtype in df.dtypes
     if dtype in ("double", "int", "bigint", "float") and name not in excluded
