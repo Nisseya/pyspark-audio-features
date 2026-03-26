@@ -4,11 +4,17 @@ import dotenv
 
 dotenv.load_dotenv()
 
-_hadoop_home = os.getenv("HADOOP_HOME")
-if _hadoop_home:
-    os.environ["PATH"] = _hadoop_home + r"\bin;" + os.environ.get("PATH", "")
-os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
-os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+if os.getenv("CESTQUIQUIADESPROBLEMESAVECSPARK") == "Leo":
+    os.environ["PYSPARK_PYTHON"] = r"C:\spark-env\Scripts\python.exe"
+    os.environ["PYSPARK_DRIVER_PYTHON"] = r"C:\spark-env\Scripts\python.exe"
+    os.environ["HADOOP_HOME"] = r"C:\hadoop"
+    os.environ["PATH"] = r"C:\hadoop\bin;" + os.environ["PATH"]
+
+# _hadoop_home = os.getenv("HADOOP_HOME")
+# if _hadoop_home:
+#     os.environ["PATH"] = _hadoop_home + r"\bin;" + os.environ.get("PATH", "")
+# os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+# os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
