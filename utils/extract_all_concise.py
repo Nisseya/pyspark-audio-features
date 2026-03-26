@@ -3,6 +3,16 @@ import warnings
 import numpy as np
 import librosa
 
+import dotenv
+
+dotenv.load_dotenv()
+
+if os.getenv("CESTQUIQUIADESPROBLEMESAVECSPARK") == "Leo":
+    os.environ["PYSPARK_PYTHON"] = r"C:\spark-env\Scripts\python.exe"
+    os.environ["PYSPARK_DRIVER_PYTHON"] = r"C:\spark-env\Scripts\python.exe"
+    os.environ["HADOOP_HOME"] = r"C:\hadoop"
+    os.environ["PATH"] = r"C:\hadoop\bin;" + os.environ["PATH"]
+
 from tqdm import tqdm
 
 from pyspark.sql import SparkSession
@@ -160,71 +170,74 @@ extract_udf = udf(extract_features_compact, schema)
 # =========================
 # Data : paths wav
 # =========================
-audio_root = "data/audio/wav"
-out_path = "data/features/parquet_compact"
 
-paths_df = (
-    spark.read.format("binaryFile")
-    .option("pathGlobFilter", "*.wav")
-    .option("recursiveFileLookup", "true")
-    .load(audio_root)
-    .select("path")
-    .dropDuplicates(["path"])
-)
+if __name__ == "__main__":
 
-total = paths_df.count()
-print("TOTAL WAV:", total)
+    audio_root = "data/audio/wav"
+    out_path = "data/features/parquet_compact"
 
-# =========================
-# Batching stable (row_number)
-# =========================
-BATCH_SIZE = 200  # ajuste: 100-500 selon RAM/CPU
-
-w = Window.orderBy("path")
-paths_df = paths_df.withColumn("rn", row_number().over(w) - 1)
-paths_df = paths_df.withColumn("batch_id", floor(col("rn") / lit(BATCH_SIZE)).cast("long")).drop("rn")
-
-batch_ids = [r["batch_id"] for r in paths_df.select("batch_id").distinct().orderBy("batch_id").collect()]
-print("BATCHES:", len(batch_ids), "| BATCH_SIZE:", BATCH_SIZE)
-print("OUT:", os.path.abspath(out_path))
-
-spark._jsc.hadoopConfiguration().set("parquet.enable.summary-metadata", "false")
-
-ok_total = 0
-ko_total = 0
-
-for bid in tqdm(batch_ids, desc="Batches", unit="batch"):
-    batch = paths_df.filter(col("batch_id") == lit(bid)).repartition(8)e
-    if batch.rdd.isEmpty():
-        continue
-
-    feat_df = (
-        batch
-        .withColumn("f", extract_udf(col("path")))
-        .select("path", "batch_id", "f.*")
+    paths_df = (
+        spark.read.format("binaryFile")
+        .option("pathGlobFilter", "*.wav")
+        .option("recursiveFileLookup", "true")
+        .load(audio_root)
+        .select("path")
+        .dropDuplicates(["path"])
     )
 
-    c = feat_df.select(
-        Fsum(col("ok")).alias("ok"),
-        Fsum((1 - col("ok"))).alias("ko")
-    ).collect()[0]
+    total = paths_df.count()
+    print("TOTAL WAV:", total)
 
-    ok_b = int(c["ok"])
-    ko_b = int(c["ko"])
-    ok_total += ok_b
-    ko_total += ko_b
+    # =========================
+    # Batching stable (row_number)
+    # =========================
+    BATCH_SIZE = 200  # ajuste: 100-500 selon RAM/CPU
 
-    (
-        feat_df
-        .where(col("ok") == 1)
-        .drop("ok")
-        .write
-        .mode("append")
-        .partitionBy("batch_id")
-        .parquet(out_path)
-    )
+    w = Window.orderBy("path")
+    paths_df = paths_df.withColumn("rn", row_number().over(w) - 1)
+    paths_df = paths_df.withColumn("batch_id", floor(col("rn") / lit(BATCH_SIZE)).cast("long")).drop("rn")
 
-    tqdm.write(f"batch={bid} ok={ok_b} ko={ko_b} | cumul ok={ok_total} ko={ko_total}")
+    batch_ids = [r["batch_id"] for r in paths_df.select("batch_id").distinct().orderBy("batch_id").collect()]
+    print("BATCHES:", len(batch_ids), "| BATCH_SIZE:", BATCH_SIZE)
+    print("OUT:", os.path.abspath(out_path))
 
-print("DONE | OK:", ok_total, "KO:", ko_total)
-spark.stop()
+    spark._jsc.hadoopConfiguration().set("parquet.enable.summary-metadata", "false")
+
+    ok_total = 0
+    ko_total = 0
+
+    for bid in tqdm(batch_ids, desc="Batches", unit="batch"):
+        batch = paths_df.filter(col("batch_id") == lit(bid)).repartition(8)
+        if batch.rdd.isEmpty():
+            continue
+
+        feat_df = (
+            batch
+            .withColumn("f", extract_udf(col("path")))
+            .select("path", "batch_id", "f.*")
+        )
+
+        c = feat_df.select(
+            Fsum(col("ok")).alias("ok"),
+            Fsum((1 - col("ok"))).alias("ko")
+        ).collect()[0]
+
+        ok_b = int(c["ok"])
+        ko_b = int(c["ko"])
+        ok_total += ok_b
+        ko_total += ko_b
+
+        (
+            feat_df
+            .where(col("ok") == 1)
+            .drop("ok")
+            .write
+            .mode("append")
+            .partitionBy("batch_id")
+            .parquet(out_path)
+        )
+
+        tqdm.write(f"batch={bid} ok={ok_b} ko={ko_b} | cumul ok={ok_total} ko={ko_total}")
+
+    print("DONE | OK:", ok_total, "KO:", ko_total)
+    spark.stop()

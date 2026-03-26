@@ -1,3 +1,4 @@
 data/audio/*
 .venv/
 */__pycache__
+.env
