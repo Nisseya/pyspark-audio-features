@@ -24,16 +24,13 @@ if os.getenv("CESTQUIQUIADESPROBLEMESAVECSPARK") == "Leo":
     os.environ["HADOOP_HOME"] = r"C:\hadoop"
     os.environ["PATH"] = r"C:\hadoop\bin;" + os.environ["PATH"]
 
-import numpy as np
-import librosa
 import warnings
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField, DoubleType, IntegerType, StringType
-)
-from pyspark.sql.functions import udf
+
+from yt_dlp import YoutubeDL
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -168,6 +165,162 @@ COLORS = px.colors.qualitative.D3
 # ── SECTION : Analyse ta propre piste ────────────────────────────────────────
 # ════════════════════════════════════════════════════════════════════════════════
 
+def show_track_feats(track_feats):
+    st.success("Features extraites ✔")
+
+    # ── KPIs de la piste ──────────────────────────────────────────────────
+    st.markdown("#### 📊 Features de ta piste")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Tempo",     f"{track_feats['tempo']:.1f} bpm")
+    k2.metric("Durée",     f"{track_feats['duration']:.0f} s")
+    k3.metric("Centroid",  f"{track_feats['centroid_mean']:.0f} Hz")
+    k4.metric("RMS",       f"{track_feats['rms_mean']:.4f}")
+    k5.metric("ZCR",       f"{track_feats['zcr_mean']:.4f}")
+
+    # ── Barres contextuelles : ta piste vs dataset (bullet charts) ────────
+    st.markdown("#### 🔍 Ta piste dans le contexte du dataset")
+    st.write(
+        "Chaque bullet chart positionne ta valeur (barre rouge) "
+        "dans la distribution du dataset : gris foncé = P10–P90, gris clair = min–max."
+    )
+
+    compare_cfg = [
+        ("Tempo (bpm)",   "tempo",          "{:.1f} bpm"),
+        ("Centroid (Hz)", "centroid_mean",  "{:.0f} Hz"),
+        ("RMS",           "rms_mean",       "{:.4f}"),
+        ("ZCR",           "zcr_mean",       "{:.4f}"),
+        ("Flatness",      "flatness_mean",  "{:.5f}"),
+    ]
+
+    for i in range(0, len(compare_cfg), 2):
+        cols = st.columns(2)
+
+        for j, (label, feat_key, fmt) in enumerate(compare_cfg[i:i+2]):
+            track_val = track_feats.get(feat_key, 0.0)
+            ds_mean   = feat_stats.get(f"{feat_key}__mean", 0.0) or 0.0
+            ds_std    = feat_stats.get(f"{feat_key}__std", 0.0)  or 0.0
+            ds_min    = feat_stats.get(f"{feat_key}__min", 0.0)  or 0.0
+            ds_max    = feat_stats.get(f"{feat_key}__max", 0.0)  or 1.0
+            ds_p10    = feat_stats.get(f"{feat_key}__p10", ds_min) or ds_min
+            ds_p90    = feat_stats.get(f"{feat_key}__p90", ds_max) or ds_max
+
+            fig_b = go.Figure(go.Indicator(
+                mode="number+gauge",
+                value=track_val,
+                number={"valueformat": ".4g", "font": {"size": 22}},
+                gauge={
+                    "shape": "bullet",
+                    "axis": {"range": [ds_min, ds_max]},
+                    "threshold": {
+                        "line": {"color": "#FF3333", "width": 3},
+                        "thickness": 0.85,
+                        "value": track_val,
+                    },
+                    "steps": [
+                        {"range": [ds_min, ds_max], "color": "#e8e8e8"},
+                        {"range": [ds_p10, ds_p90], "color": "#aaaaaa"},
+                        {"range": [ds_mean - ds_std, ds_mean + ds_std], "color": "#666666"},
+                    ],
+                    "bar": {"color": "#FF3333", "thickness": 0.3},
+                },
+                title={"text": label, "font": {"size": 13}},
+            ))
+
+            fig_b.update_layout(
+                height=110,
+                margin=dict(l=10, r=10, t=30, b=10),
+            )
+
+            with cols[j]:
+                st.markdown(f"**{label}**")
+                st.plotly_chart(fig_b, use_container_width=True)
+                delta = track_val - ds_mean
+                delta_pct = delta / ds_mean * 100 if ds_mean else 0
+                sign = "+" if delta_pct >= 0 else ""
+                color = "🔴" if abs(delta_pct) > 30 else "🟡" if abs(delta_pct) > 10 else "🟢"
+                st.caption(f"{color} {sign}{delta_pct:.1f}% vs moyenne dataset")
+
+    # ── Radar MFCC : ta piste vs genres du dataset ────────────────────────
+    st.markdown("#### 🕸️ Profil timbral — ta piste vs genres du dataset")
+    st.write(
+        "Ton profil MFCC 1–5 (rouge, premier plan) superposé aux "
+        "6 genres les plus représentés du dataset."
+    )
+
+    top6 = stats.head(6)
+    fig_cmp = go.Figure()
+    mfcc_labels = ["MFCC 1","MFCC 2","MFCC 3","MFCC 4","MFCC 5","MFCC 1"]
+
+    for i, row in top6.iterrows():
+        vals = [row["mfcc1"], row["mfcc2"], row["mfcc3"], row["mfcc4"], row["mfcc5"]] + [row["mfcc1"]]
+        fig_cmp.add_trace(go.Scatterpolar(
+            r=vals, theta=mfcc_labels,
+            fill="toself", opacity=0.22, name=row["genres"],
+            line=dict(color=COLORS[i % len(COLORS)], width=1),
+        ))
+
+    track_mfcc = [track_feats.get(f"mfcc_{j}_mean", 0.0) for j in range(1, 6)]
+    track_mfcc += track_mfcc[:1]
+    fig_cmp.add_trace(go.Scatterpolar(
+        r=track_mfcc, theta=mfcc_labels,
+        fill="toself", opacity=0.6,
+        name="🎵 Ta piste",
+        line=dict(color="#FF3333", width=3),
+        fillcolor="rgba(255,51,51,0.18)",
+    ))
+
+    fig_cmp.update_layout(
+        polar=dict(radialaxis=dict(visible=True)),
+        legend=dict(orientation="h", y=-0.18),
+        margin=dict(l=40, r=40, t=20, b=80),
+        height=460,
+    )
+    st.plotly_chart(fig_cmp, use_container_width=True)
+
+    # ── Chromagramme polaire ───────────────────────────────────────────────
+    st.markdown("#### 🎹 Empreinte chromatique de ta piste")
+    st.write(
+        "Le chromagramme moyen indique quelles notes (C → B) dominent dans ta piste. "
+        "Utile pour identifier la tonalité et les couleurs harmoniques."
+    )
+    notes       = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+    chroma_vals = [track_feats.get(f"chroma_{i+1}_mean", 0.0) for i in range(12)]
+    fig_chroma  = px.bar_polar(
+        r=chroma_vals, theta=notes,
+        color=chroma_vals,
+        color_continuous_scale="Plasma",
+    )
+    fig_chroma.update_layout(
+        margin=dict(l=20, r=20, t=20, b=20),
+        height=360,
+        coloraxis_showscale=False,
+    )
+    st.plotly_chart(fig_chroma, use_container_width=True)
+
+    # ── Tonnetz : relations harmoniques ───────────────────────────────────
+    with st.expander("Détails — Tonnetz & Contrast spectral"):
+        t1, t2 = st.columns(2)
+        with t1:
+            st.markdown("**Tonnetz (6 dimensions)**")
+            tn_labels = ["5th","Minor 3rd","Major 3rd","5th im","m3 im","M3 im"]
+            tn_vals   = [track_feats.get(f"tonnetz_{i+1}_mean", 0.0) for i in range(6)]
+            fig_tn = px.bar(x=tn_labels, y=tn_vals,
+                            labels={"x": "", "y": "Valeur moyenne"},
+                            color=tn_vals, color_continuous_scale="RdBu_r")
+            fig_tn.update_layout(coloraxis_showscale=False, height=260, margin=dict(l=0,r=0,t=10,b=0))
+            st.plotly_chart(fig_tn, use_container_width=True)
+        with t2:
+            st.markdown("**Contrast spectral (7 bandes)**")
+            ct_labels = [f"Band {i+1}" for i in range(7)]
+            ct_vals   = [track_feats.get(f"contrast_{i+1}_mean", 0.0) for i in range(7)]
+            fig_ct = px.bar(x=ct_labels, y=ct_vals,
+                            labels={"x": "", "y": "Contraste moyen"},
+                            color=ct_vals, color_continuous_scale="Viridis")
+            fig_ct.update_layout(coloraxis_showscale=False, height=260, margin=dict(l=0,r=0,t=10,b=0))
+            st.plotly_chart(fig_ct, use_container_width=True)
+
+    st.divider()
+
 st.divider()
 st.header("Analyse ta propre piste")
 st.divider()
@@ -179,12 +332,14 @@ st.write(
 
 input_mode = st.radio(
     "Source",
-    ["Fichier MP3", "URL YouTube"],
+    ["Fichier MP3", "URL YouTube", "Historique des musiques téléchargées"],
     horizontal=True,
     label_visibility="collapsed",
 )
 
 audio_path_for_analysis = None
+music_name = None
+track_feats = None
 
 if input_mode == "Fichier MP3":
     uploaded = st.file_uploader(
@@ -196,15 +351,21 @@ if input_mode == "Fichier MP3":
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(uploaded.read())
             audio_path_for_analysis = tmp.name
+        music_name = uploaded.name
         st.success(f"Fichier chargé : `{uploaded.name}`")
 
-else:  # YouTube
+elif input_mode == "URL YouTube":
     yt_url = st.text_input("URL YouTube", placeholder="https://www.youtube.com/watch?v=...")
     if yt_url:
         with st.spinner("Téléchargement via yt-dlp…"):
             try:
                 tmpdir = tempfile.mkdtemp()
                 out_template = os.path.join(tmpdir, "track.%(ext)s")
+                
+                with YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
+                    info = ydl.extract_info(yt_url, download=False)
+                    music_name = info.get("title", "Unknown Title")
+
                 result = subprocess.run(
                     [
                         "yt-dlp",
@@ -213,6 +374,7 @@ else:  # YouTube
                         "--audio-quality", "0",
                         "-o", out_template,
                         "--no-playlist",
+                        "--js-runtimes", "node",
                         yt_url,
                     ],
                     capture_output=True,
@@ -227,15 +389,43 @@ else:  # YouTube
                     st.error(
                         f"yt-dlp n'a pas pu extraire l'audio.\n"
                         f"stderr: {result.stderr[:400]}\n"
-                        "Vérifiez l'URL ou installez yt-dlp (`pip install yt-dlp`)."
+                        " Vérifiez l'URL ou installez yt-dlp (`pip install yt-dlp`)."
                     )
             except FileNotFoundError:
                 st.error("yt-dlp introuvable — installez-le : `pip install yt-dlp`")
             except subprocess.TimeoutExpired:
                 st.error("Timeout — vidéo trop longue ou connexion lente.")
 
+elif input_mode == "Historique des musiques téléchargées":
+    st.header("🎵 Historique des musiques téléchargées")
+    history_path = "data/features/history_features"
+    spark = get_spark()
 
-def analyse_single_track(path: str) -> dict | None:
+    if os.path.exists(history_path):
+        history_feats_df = spark.read.parquet(history_path)
+        if not history_feats_df.head(1):
+            st.warning("Aucune musique dans l'historique.")
+        else:
+            st.success(f"{history_feats_df.count()} pistes chargées depuis l'historique.")
+    else:
+        st.warning("Pas de fichier `history_features.parquet` trouvé.")
+    
+    if history_feats_df is not None and history_feats_df.head(1):
+        track_names = history_feats_df.toPandas()["filename"].tolist()
+        selected_track_name = st.selectbox(
+            "Choisis une piste à afficher",
+            track_names,
+            index=0,
+        )
+        
+        if st.button("Afficher les features"):
+            track_feats_row = history_feats_df.filter(
+                F.col("filename") == selected_track_name
+            ).withColumn("duration", F.lit(3005)).first().asDict()
+
+            show_track_feats(track_feats_row)
+
+def analyse_single_track(path: str):
     spark = get_spark()
 
     abs_path = os.path.abspath(path)
@@ -248,6 +438,10 @@ def analyse_single_track(path: str) -> dict | None:
         .withColumn("f", extract_udf(F.col("path")))
         .select("f.*")
     )
+    
+    feat_df = feat_df.withColumn("filename", F.lit(music_name or "Unknown Track"))
+    output_path = "data/features/history_features"
+    feat_df.write.mode("append").parquet(output_path)
 
     row = feat_df.first()
 
@@ -270,162 +464,11 @@ if audio_path_for_analysis:
             track_feats["duration"] = float(
                 _librosa.get_duration(path=audio_path_for_analysis)
             )
-
-    if track_feats:
-        st.success("Features extraites ✔")
-
-        # ── KPIs de la piste ──────────────────────────────────────────────────
-        st.markdown("#### 📊 Features de ta piste")
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Tempo",     f"{track_feats['tempo']:.1f} bpm")
-        k2.metric("Durée",     f"{track_feats['duration']:.0f} s")
-        k3.metric("Centroid",  f"{track_feats['centroid_mean']:.0f} Hz")
-        k4.metric("RMS",       f"{track_feats['rms_mean']:.4f}")
-        k5.metric("ZCR",       f"{track_feats['zcr_mean']:.4f}")
-
-        # ── Barres contextuelles : ta piste vs dataset (bullet charts) ────────
-        st.markdown("#### 🔍 Ta piste dans le contexte du dataset")
-        st.write(
-            "Chaque bullet chart positionne ta valeur (barre rouge) "
-            "dans la distribution du dataset : gris foncé = P10–P90, gris clair = min–max."
-        )
-
-        compare_cfg = [
-            ("Tempo (bpm)",   "tempo",          "{:.1f} bpm"),
-            ("Centroid (Hz)", "centroid_mean",   "{:.0f} Hz"),
-            ("RMS",           "rms_mean",        "{:.4f}"),
-            ("ZCR",           "zcr_mean",        "{:.4f}"),
-            ("Flatness",      "flatness_mean",   "{:.5f}"),
-        ]
-
-        bcols = st.columns(len(compare_cfg))
-        for col_idx, (label, feat_key, fmt) in enumerate(compare_cfg):
-            track_val = track_feats.get(feat_key, 0.0)
-            ds_mean   = feat_stats.get(f"{feat_key}__mean", 0.0) or 0.0
-            ds_std    = feat_stats.get(f"{feat_key}__std", 0.0)  or 0.0
-            ds_min    = feat_stats.get(f"{feat_key}__min", 0.0)  or 0.0
-            ds_max    = feat_stats.get(f"{feat_key}__max", 0.0)  or 1.0
-            ds_p10    = feat_stats.get(f"{feat_key}__p10", ds_min) or ds_min
-            ds_p90    = feat_stats.get(f"{feat_key}__p90", ds_max) or ds_max
-
-            # Bullet chart en Plotly
-            fig_b = go.Figure(go.Indicator(
-                mode="number+gauge",
-                value=track_val,
-                number={"valueformat": ".4g", "font": {"size": 22}},
-                gauge={
-                    "shape": "bullet",
-                    "axis": {"range": [ds_min, ds_max]},
-                    "threshold": {
-                        "line": {"color": "#FF3333", "width": 3},
-                        "thickness": 0.85,
-                        "value": track_val,
-                    },
-                    "steps": [
-                        {"range": [ds_min, ds_max],   "color": "#e8e8e8"},
-                        {"range": [ds_p10, ds_p90],   "color": "#aaaaaa"},
-                        {"range": [ds_mean - ds_std, ds_mean + ds_std], "color": "#666666"},
-                    ],
-                    "bar": {"color": "#FF3333", "thickness": 0.3},
-                },
-                title={"text": label, "font": {"size": 13}},
-                domain={"x": [0, 1], "y": [0, 1]},
-            ))
-            fig_b.update_layout(
-                height=110,
-                margin=dict(l=10, r=10, t=30, b=10),
-            )
-            with bcols[col_idx]:
-                st.plotly_chart(fig_b, use_container_width=True)
-                delta = track_val - ds_mean
-                delta_pct = delta / ds_mean * 100 if ds_mean else 0
-                sign = "+" if delta_pct >= 0 else ""
-                color = "🔴" if abs(delta_pct) > 30 else "🟡" if abs(delta_pct) > 10 else "🟢"
-                st.caption(f"{color} {sign}{delta_pct:.1f}% vs moyenne dataset")
-
-        # ── Radar MFCC : ta piste vs genres du dataset ────────────────────────
-        st.markdown("#### 🕸️ Profil timbral — ta piste vs genres du dataset")
-        st.write(
-            "Ton profil MFCC 1–5 (rouge, premier plan) superposé aux "
-            "6 genres les plus représentés du dataset."
-        )
-
-        top6 = stats.head(6)
-        fig_cmp = go.Figure()
-        mfcc_labels = ["MFCC 1","MFCC 2","MFCC 3","MFCC 4","MFCC 5","MFCC 1"]
-
-        for i, row in top6.iterrows():
-            vals = [row["mfcc1"], row["mfcc2"], row["mfcc3"], row["mfcc4"], row["mfcc5"]] + [row["mfcc1"]]
-            fig_cmp.add_trace(go.Scatterpolar(
-                r=vals, theta=mfcc_labels,
-                fill="toself", opacity=0.22, name=row["genres"],
-                line=dict(color=COLORS[i % len(COLORS)], width=1),
-            ))
-
-        track_mfcc = [track_feats.get(f"mfcc_{j}_mean", 0.0) for j in range(1, 6)]
-        track_mfcc += track_mfcc[:1]
-        fig_cmp.add_trace(go.Scatterpolar(
-            r=track_mfcc, theta=mfcc_labels,
-            fill="toself", opacity=0.6,
-            name="🎵 Ta piste",
-            line=dict(color="#FF3333", width=3),
-            fillcolor="rgba(255,51,51,0.18)",
-        ))
-
-        fig_cmp.update_layout(
-            polar=dict(radialaxis=dict(visible=True)),
-            legend=dict(orientation="h", y=-0.18),
-            margin=dict(l=40, r=40, t=20, b=80),
-            height=460,
-        )
-        st.plotly_chart(fig_cmp, use_container_width=True)
-
-        # ── Chromagramme polaire ───────────────────────────────────────────────
-        st.markdown("#### 🎹 Empreinte chromatique de ta piste")
-        st.write(
-            "Le chromagramme moyen indique quelles notes (C → B) dominent dans ta piste. "
-            "Utile pour identifier la tonalité et les couleurs harmoniques."
-        )
-        notes       = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-        chroma_vals = [track_feats.get(f"chroma_{i+1}_mean", 0.0) for i in range(12)]
-        fig_chroma  = px.bar_polar(
-            r=chroma_vals, theta=notes,
-            color=chroma_vals,
-            color_continuous_scale="Plasma",
-        )
-        fig_chroma.update_layout(
-            margin=dict(l=20, r=20, t=20, b=20),
-            height=360,
-            coloraxis_showscale=False,
-        )
-        st.plotly_chart(fig_chroma, use_container_width=True)
-
-        # ── Tonnetz : relations harmoniques ───────────────────────────────────
-        with st.expander("Détails — Tonnetz & Contrast spectral"):
-            t1, t2 = st.columns(2)
-            with t1:
-                st.markdown("**Tonnetz (6 dimensions)**")
-                tn_labels = ["5th","Minor 3rd","Major 3rd","5th im","m3 im","M3 im"]
-                tn_vals   = [track_feats.get(f"tonnetz_{i+1}_mean", 0.0) for i in range(6)]
-                fig_tn = px.bar(x=tn_labels, y=tn_vals,
-                                labels={"x": "", "y": "Valeur moyenne"},
-                                color=tn_vals, color_continuous_scale="RdBu_r")
-                fig_tn.update_layout(coloraxis_showscale=False, height=260, margin=dict(l=0,r=0,t=10,b=0))
-                st.plotly_chart(fig_tn, use_container_width=True)
-            with t2:
-                st.markdown("**Contrast spectral (7 bandes)**")
-                ct_labels = [f"Band {i+1}" for i in range(7)]
-                ct_vals   = [track_feats.get(f"contrast_{i+1}_mean", 0.0) for i in range(7)]
-                fig_ct = px.bar(x=ct_labels, y=ct_vals,
-                                labels={"x": "", "y": "Contraste moyen"},
-                                color=ct_vals, color_continuous_scale="Viridis")
-                fig_ct.update_layout(coloraxis_showscale=False, height=260, margin=dict(l=0,r=0,t=10,b=0))
-                st.plotly_chart(fig_ct, use_container_width=True)
-
+            
+    if track_feats is not None:
+        show_track_feats(track_feats)
     else:
         st.error("Impossible d'extraire les features. Vérifie que `librosa` est installé et que le fichier est valide.")
-
-st.divider()
 
 
 # ════════════════════════════════════════════════════════════════════════════════

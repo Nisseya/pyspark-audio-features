@@ -23,16 +23,6 @@ from pyspark.sql.functions import udf
 
 warnings.filterwarnings("ignore")
 
-spark = (
-    SparkSession.builder
-    .appName("AudioFeaturesCompactWithTQDM")
-    .master("local[*]")
-    .config("spark.driver.memory", "8g")
-    .config("spark.sql.shuffle.partitions", "16")
-    .getOrCreate()
-)
-spark.sparkContext.setLogLevel("ERROR")
-
 # =========================
 # Helpers : stats compactes
 # =========================
@@ -107,7 +97,7 @@ schema = StructType(fields)
 # UDF : compact features
 # =========================
 def extract_features_compact(path: str):
-    clean_path = path.replace("file:", "") if path.startswith("file:") else path
+    clean_path = path.replace("file:///", "").replace("file://", "").replace("file:/", "").replace("\\", "/")
     try:
         y, sr = librosa.load(clean_path, sr=None, mono=True)
         if y is None or len(y) < 100:
@@ -151,7 +141,8 @@ def extract_features_compact(path: str):
         out.append(1)
         return tuple(out)
 
-    except Exception:
+    except Exception as e:
+        print(f"Error processing {clean_path}: {e}")
         return tuple([0.0] * (len(fields) - 1) + [0])
 
 extract_udf = udf(extract_features_compact, schema)
@@ -161,6 +152,16 @@ extract_udf = udf(extract_features_compact, schema)
 # =========================
 
 if __name__ == "__main__":
+
+    spark = (
+        SparkSession.builder
+        .appName("AudioFeaturesCompactWithTQDM")
+        .master("local[*]")
+        .config("spark.driver.memory", "8g")
+        .config("spark.sql.shuffle.partitions", "16")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("ERROR")
 
     audio_root = "data/audio/wav"
     out_path = "data/features/parquet_compact"
@@ -204,24 +205,6 @@ if __name__ == "__main__":
 
         total = paths_df.count()
         print("TOTAL WAV:", total)
-
-        # =========================
-        # Batching stable (row_number)
-        # =========================
-        BATCH_SIZE = 200  # ajuste: 100-500 selon RAM/CPU
-
-        w = Window.orderBy("path")
-        paths_df = paths_df.withColumn("rn", row_number().over(w) - 1)
-        paths_df = paths_df.withColumn("batch_id", floor(col("rn") / lit(BATCH_SIZE)).cast("long")).drop("rn")
-
-        batch_ids = [r["batch_id"] for r in paths_df.select("batch_id").distinct().orderBy("batch_id").collect()]
-        print("BATCHES:", len(batch_ids), "| BATCH_SIZE:", BATCH_SIZE)
-        print("OUT:", os.path.abspath(out_path))
-
-    spark._jsc.hadoopConfiguration().set("parquet.enable.summary-metadata", "false")
-
-    ok_total = 0
-    ko_total = 0
 
     for bid in tqdm(batch_ids, desc="Batches", unit="batch"):
         batch = paths_df.filter(col("batch_id") == lit(bid)).repartition(8)
