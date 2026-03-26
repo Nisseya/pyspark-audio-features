@@ -52,40 +52,26 @@ def get_spark():
     spark.sparkContext.setLogLevel("ERROR")
     return spark
 
-@st.cache_data
+# @st.cache_data
 def load_data():
     spark = get_spark()
     out_path = "data/features/training_dataset"
     df = spark.read.parquet(out_path)
+    df = df.withColumn("genres", F.explode(F.col("genres")))
 
     total_tracks = df.count()
-
-    # Durée moyenne (colonne optionnelle) — on l'intègre dans le même agg
     has_duration = "duration" in df.columns
-    agg_base = [
+
+    # ── Stats globales
+    agg_exprs = [
         F.round(F.mean("tempo"), 1).alias("tempo_mean"),
         F.countDistinct("genres").alias("n_genres"),
     ]
     if has_duration:
-        agg_base.append(F.round(F.mean("duration"), 1).alias("duration_avg"))
+        agg_exprs.append(F.round(F.mean("duration"), 1).alias("duration_avg"))
+    global_stats = df.agg(*agg_exprs).toPandas().iloc[0].to_dict()
 
-    global_stats_pdf = df.agg(*agg_base).toPandas()
-    global_stats = global_stats_pdf.iloc[0]
-
-    duration_avg = float(global_stats["duration_avg"] or 0) if has_duration else None
-
-    df_genres = df.withColumn("genres", F.explode(F.col("genres")))
-
-    genres_df = (
-        df_genres.groupBy("genres").count()
-        .orderBy("count", ascending=False)
-        .limit(12)
-        .toPandas()
-    )
-    genres_df["pct"] = (genres_df["count"] / total_tracks * 100).round(1)
-
-    df = df_genres
-
+    # ── Tempo buckets
     tempo_buckets = (
         df.withColumn("bucket",
             F.when(F.col("tempo") < 80,  "< 80")
@@ -100,11 +86,10 @@ def load_data():
         .toPandas()
     )
     bucket_order = ["< 80","80-100","100-110","110-120","120-130","130-140","140-160","160+"]
-    tempo_buckets["bucket"] = pd.Categorical(
-        tempo_buckets["bucket"], categories=bucket_order, ordered=True
-    )
+    tempo_buckets["bucket"] = pd.Categorical(tempo_buckets["bucket"], categories=bucket_order, ordered=True)
     tempo_buckets = tempo_buckets.sort_values("bucket")
 
+    # ── Stats par genre
     stats_by_genre = (
         df.groupBy("genres").agg(
             F.round(F.mean("tempo"), 1).alias("tempo"),
@@ -125,11 +110,11 @@ def load_data():
         .fillna(0)
     )
 
-    # Statistiques globales par feature pour la comparaison (min, max, mean, std)
+    # ── Stats globales par feature (min, max, mean, std, P10, P90)
     feature_cols = ["tempo", "centroid_mean", "rms_mean", "zcr_mean", "flatness_mean"]
-    agg_exprs = []
+    agg_exprs_feat = []
     for c in feature_cols:
-        agg_exprs += [
+        agg_exprs_feat += [
             F.round(F.mean(c), 6).alias(f"{c}__mean"),
             F.round(F.stddev(c), 6).alias(f"{c}__std"),
             F.round(F.min(c), 6).alias(f"{c}__min"),
@@ -137,14 +122,13 @@ def load_data():
             F.round(F.expr(f"percentile_approx({c}, 0.10)"), 6).alias(f"{c}__p10"),
             F.round(F.expr(f"percentile_approx({c}, 0.90)"), 6).alias(f"{c}__p90"),
         ]
-    global_feature_stats = df.agg(*agg_exprs).toPandas().iloc[0].to_dict()
+    global_feature_stats = df.agg(*agg_exprs_feat).toPandas().iloc[0].to_dict()
 
-    return {
+    return df, {
         "total": total_tracks,
-        "tempo_mean": float(global_stats["tempo_mean"] or 0),
-        "n_genres": int(global_stats["n_genres"] or 0),
-        "duration_avg": duration_avg,
-        "genres_df": genres_df,
+        "tempo_mean": float(global_stats.get("tempo_mean", 0)),
+        "n_genres": int(global_stats.get("n_genres", 0)),
+        "duration_avg": float(global_stats.get("duration_avg", 0)) if has_duration else None,
         "tempo_buckets": tempo_buckets,
         "stats": stats_by_genre,
         "feature_stats": global_feature_stats,
@@ -152,12 +136,7 @@ def load_data():
 
 # ── Chargement ────────────────────────────────────────────────────────────────
 with st.spinner("Chargement des données Spark..."):
-    d = load_data()
-
-genres_df = d["genres_df"]
-tempo_df  = d["tempo_buckets"]
-stats     = d["stats"]
-feat_stats = d["feature_stats"]
+    df_spark, d = load_data()
 
 COLORS = px.colors.qualitative.D3
 
@@ -470,6 +449,71 @@ if audio_path_for_analysis:
     else:
         st.error("Impossible d'extraire les features. Vérifie que `librosa` est installé et que le fichier est valide.")
 
+st.subheader("Filtres du dataset")
+all_genres = [row["genres"] for row in df_spark.select("genres").distinct().toLocalIterator()]
+selected_genres = st.multiselect("Filtrer par genre", all_genres, default=all_genres)
+
+# min_dur, max_dur = df_spark.agg(F.min("duration"), F.max("duration")).first()
+# dur_range = st.slider(
+#     "Filtrer par durée (secondes)",
+#     min_value=int(min_dur), max_value=int(max_dur),
+#     value=(int(min_dur), int(max_dur)),
+# )
+
+df_filtered = df_spark.filter(
+    (F.col("genres").isin(selected_genres))
+    # (F.col("duration") >= dur_range[0]) &
+    # (F.col("duration") <= dur_range[1])
+)
+total_filtered = df_filtered.count()
+
+# ── Recalculer stats filtrées
+genres_df = (
+    df_filtered.groupBy("genres").count()
+    .orderBy("count", ascending=False)
+    .limit(12)
+    .toPandas()
+)
+genres_df["pct"] = (genres_df["count"] / total_filtered * 100).round(1)
+
+tempo_df = (
+    df_filtered.withColumn("bucket",
+        F.when(F.col("tempo") < 80,  "< 80")
+         .when(F.col("tempo") < 100, "80-100")
+         .when(F.col("tempo") < 110, "100-110")
+         .when(F.col("tempo") < 120, "110-120")
+         .when(F.col("tempo") < 130, "120-130")
+         .when(F.col("tempo") < 140, "130-140")
+         .when(F.col("tempo") < 160, "140-160")
+         .otherwise("160+"))
+    .groupBy("bucket").count()
+    .toPandas()
+)
+bucket_order = ["< 80","80-100","100-110","110-120","120-130","130-140","140-160","160+"]
+tempo_df["bucket"] = pd.Categorical(tempo_df["bucket"], categories=bucket_order, ordered=True)
+tempo_df = tempo_df.sort_values("bucket")
+
+stats = (
+    df_filtered.groupBy("genres").agg(
+        F.round(F.mean("tempo"), 1).alias("tempo"),
+        F.round(F.mean("centroid_mean"), 0).alias("centroid"),
+        F.round(F.mean("rms_mean"), 4).alias("rms"),
+        F.round(F.mean("zcr_mean"), 4).alias("zcr"),
+        F.round(F.mean("flatness_mean"), 5).alias("flatness"),
+        F.round(F.mean("mfcc_1_mean"), 2).alias("mfcc1"),
+        F.round(F.mean("mfcc_2_mean"), 2).alias("mfcc2"),
+        F.round(F.mean("mfcc_3_mean"), 2).alias("mfcc3"),
+        F.round(F.mean("mfcc_4_mean"), 2).alias("mfcc4"),
+        F.round(F.mean("mfcc_5_mean"), 2).alias("mfcc5"),
+        F.count("*").alias("count"),
+    )
+    .orderBy("count", ascending=False)
+    .limit(12)
+    .toPandas()
+    .fillna(0)
+)
+
+feat_stats = d["feature_stats"]
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ── Métriques globales du dataset ─────────────────────────────────────────────
@@ -478,8 +522,9 @@ if audio_path_for_analysis:
 st.header("Statistiques globales du dataset")
 st.divider()
 
+
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Pistes totales",   f"{d['total']:,}")
+c1.metric("Pistes totales",   f"{total_filtered:,}")
 c2.metric("Durée moyenne",    f"{d['duration_avg']:.0f} s" if d["duration_avg"] else "—")
 c3.metric("Genres distincts", str(d["n_genres"]))
 c4.metric("Tempo moyen",      f"{d['tempo_mean']} bpm")
