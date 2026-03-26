@@ -2,3 +2,4 @@ data/audio/*
 .venv/
 */__pycache__
 .env
+data/features/history_features
