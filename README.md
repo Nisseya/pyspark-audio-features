@@ -36,7 +36,10 @@ sudo apt install ffmpeg -y
 ```
 
 ### Windows:
-Débrouillez vous
+```shell
+winget install ffmpeg   
+ffmpeg -version
+```
 
 ### Mac (Ilya):
 Débrouille toi

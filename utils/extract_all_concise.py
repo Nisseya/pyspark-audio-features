@@ -7,11 +7,13 @@ import dotenv
 
 dotenv.load_dotenv()
 
-if os.getenv("CESTQUIQUIADESPROBLEMESAVECSPARK") == "Leo":
-    os.environ["PYSPARK_PYTHON"] = r"C:\spark-env\Scripts\python.exe"
-    os.environ["PYSPARK_DRIVER_PYTHON"] = r"C:\spark-env\Scripts\python.exe"
-    os.environ["HADOOP_HOME"] = r"C:\hadoop"
-    os.environ["PATH"] = r"C:\hadoop\bin;" + os.environ["PATH"]
+import sys
+
+_hadoop_home = os.getenv("HADOOP_HOME")
+if _hadoop_home:
+    os.environ["PATH"] = _hadoop_home + r"\bin;" + os.environ.get("PATH", "")
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
 from tqdm import tqdm
 
@@ -23,15 +25,15 @@ from pyspark.sql.functions import udf
 
 warnings.filterwarnings("ignore")
 
-spark = (
-    SparkSession.builder
-    .appName("AudioFeaturesCompactWithTQDM")
-    .master("local[*]")
-    .config("spark.driver.memory", "8g")
-    .config("spark.sql.shuffle.partitions", "16")
-    .getOrCreate()
-)
-spark.sparkContext.setLogLevel("ERROR")
+# spark = (
+#     SparkSession.builder
+#     .appName("AudioFeaturesCompactWithTQDM")
+#     .master("local[*]")
+#     .config("spark.driver.memory", "8g")
+#     .config("spark.sql.shuffle.partitions", "16")
+#     .getOrCreate()
+# )
+# spark.sparkContext.setLogLevel("ERROR")
 
 # =========================
 # Helpers : stats compactes
@@ -161,6 +163,16 @@ extract_udf = udf(extract_features_compact, schema)
 # =========================
 
 if __name__ == "__main__":
+#  Added Session here
+    spark = (
+        SparkSession.builder
+        .appName("AudioFeaturesCompactWithTQDM")
+        .master("local[*]")
+        .config("spark.driver.memory", "8g")
+        .config("spark.sql.shuffle.partitions", "16")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("ERROR")
 
     audio_root = "data/audio/wav"
     out_path = "data/features/parquet_compact"
