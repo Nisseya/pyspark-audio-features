@@ -36,18 +36,7 @@ spark.sparkContext.setLogLevel("ERROR")
 # =========================
 # Helpers : stats compactes
 # =========================
-def _stats_1d(x):
-    x = np.asarray(x, dtype=np.float64).reshape(-1)
-    if x.size == 0:
-        return 0.0, 0.0, 0.0, 0.0
-    return float(x.mean()), float(x.std()), float(x.min()), float(x.max())
-
-def _stats_2d_rows(M, n_rows):
-    M = np.asarray(M, dtype=np.float64)
-    out = []
-    for i in range(n_rows):
-        out.extend(_stats_1d(M[i, :]))
-    return out
+from utils.features import _stats_1d, _stats_2d_rows
 
 # =========================
 # Schéma compact : scalaires
@@ -184,10 +173,6 @@ if __name__ == "__main__":
         .select("path")
         .dropDuplicates(["path"])
     )
-
-    total = paths_df.count()
-    print("TOTAL WAV:", total)
-
     # =========================
     # Batching stable (row_number)
     # =========================
@@ -200,6 +185,38 @@ if __name__ == "__main__":
     batch_ids = [r["batch_id"] for r in paths_df.select("batch_id").distinct().orderBy("batch_id").collect()]
     print("BATCHES:", len(batch_ids), "| BATCH_SIZE:", BATCH_SIZE)
     print("OUT:", os.path.abspath(out_path))
+
+    spark._jsc.hadoopConfiguration().set("parquet.enable.summary-metadata", "false")
+
+    ok_total = 0
+    ko_total = 0
+
+    for bid in tqdm(batch_ids, desc="Batches", unit="batch"):
+        batch = paths_df.filter(col("batch_id") == lit(bid)).repartition(8)
+        if batch.rdd.isEmpty():
+            continue
+
+        feat_df = (
+            batch
+            .withColumn("f", extract_udf(col("path")))
+            .select("path", "batch_id", "f.*")
+        )
+
+        total = paths_df.count()
+        print("TOTAL WAV:", total)
+
+        # =========================
+        # Batching stable (row_number)
+        # =========================
+        BATCH_SIZE = 200  # ajuste: 100-500 selon RAM/CPU
+
+        w = Window.orderBy("path")
+        paths_df = paths_df.withColumn("rn", row_number().over(w) - 1)
+        paths_df = paths_df.withColumn("batch_id", floor(col("rn") / lit(BATCH_SIZE)).cast("long")).drop("rn")
+
+        batch_ids = [r["batch_id"] for r in paths_df.select("batch_id").distinct().orderBy("batch_id").collect()]
+        print("BATCHES:", len(batch_ids), "| BATCH_SIZE:", BATCH_SIZE)
+        print("OUT:", os.path.abspath(out_path))
 
     spark._jsc.hadoopConfiguration().set("parquet.enable.summary-metadata", "false")
 
