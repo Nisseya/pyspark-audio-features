@@ -1,4 +1,5 @@
 import os
+import random
 import warnings
 import numpy as np
 import librosa
@@ -18,6 +19,7 @@ from pyspark.sql.functions import col, lit, floor, row_number, sum as Fsum
 from pyspark.sql.window import Window
 from pyspark.sql.types import StructType, StructField, DoubleType, IntegerType, StringType
 from pyspark.sql.functions import udf
+from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
@@ -93,6 +95,8 @@ for name in ["rms", "zcr"]:
 
 fields.append(StructField("filename", StringType()))
 fields.append(StructField("duration", DoubleType()))
+fields.append(StructField("user_id", IntegerType()))
+fields.append(StructField("uploaded_at", StringType()))
 fields.append(StructField("ok", IntegerType()))
 
 schema = StructType(fields)
@@ -155,9 +159,13 @@ def extract_features_compact(path: str):
 
         filename = blob_name.split("/")[-1]
         duration = float(len(y)) / float(sr)
-
+        user_id = random.randint(1, 100)
+        uploaded_at = datetime.now().strftime("%Y-%m-%d")
+        
         out.append(filename)
         out.append(duration)
+        out.append(user_id)
+        out.append(uploaded_at)
         out.append(1)
         return tuple(out)
 

@@ -51,33 +51,60 @@ def get_spark():
     spark.sparkContext.setLogLevel("ERROR")
     return spark
 
-@st.cache_data
-def load_data():
-    """Charge et agrège les données depuis le dataset Parquet via Spark."""
-    spark    = get_spark()
-    out_path = "./data/features_training_dataset_dataset.parquet"
-    df       = spark.read.parquet(out_path)
+@st.cache_resource
+def load_raw():
+    """
+    Charge le Parquet UNE seule fois et le met en cache comme ressource Spark.
+    Retourne (df_exploded, meta) où meta contient les valeurs fixes pour la sidebar
+    (liste des user_ids, plage de dates globale).
+    Le DataFrame retourné a déjà la colonne 'genres' normalisée (explodée ou renommée).
+    """
+    spark = get_spark()
+    out_path = "./data/features/training_dataset"
+    df = spark.read.parquet(out_path)
 
-    total_tracks = df.count()
-
-    has_duration = "duration" in df.columns
     genre_col = "genre" if "genre" in df.columns else "genres"
-
-    agg_base = [
-        F.round(F.mean("tempo"), 1).alias("tempo_mean"),
-        F.countDistinct(genre_col).alias("n_genres"),
-    ]
-    if has_duration:
-        agg_base.append(F.round(F.mean("duration"), 1).alias("duration_avg"))
-
-    global_stats_pdf = df.agg(*agg_base).toPandas()
-    global_stats = global_stats_pdf.iloc[0]
-    duration_avg = float(global_stats["duration_avg"] or 0) if has_duration else None
-
     if genre_col == "genres":
         df = df.withColumn("genres", F.explode(F.col("genres")))
     else:
         df = df.withColumnRenamed("genre", "genres")
+
+    # Valeurs fixes pour alimenter les contrôles sidebar (calculées une seule fois)
+    user_ids = sorted(
+        [r[0] for r in df.select("user_id").distinct().collect() if r[0] is not None]
+    )
+    
+    date_range = df.agg(
+        F.min("uploaded_at").alias("date_min"),
+        F.max("uploaded_at").alias("date_max"),
+    ).collect()[0]
+
+    meta = {
+        "user_ids": user_ids,
+        "uploaded_at_min": date_range["date_min"],
+        "uploaded_at_max": date_range["date_max"],
+        "has_duration": "duration" in df.columns,
+    }
+    return df, meta
+
+
+def compute_aggregates(df):
+    """
+    Calcule tous les KPI et agrégats sur le DataFrame (éventuellement filtré).
+    Appelée à chaque interaction — pas de @st.cache_data ici.
+    """
+    total_tracks = df.count()
+
+    agg_base = [
+        F.round(F.mean("tempo"), 1).alias("tempo_mean"),
+        F.countDistinct("genres").alias("n_genres"),
+    ]
+    if "duration" in df.columns:
+        agg_base.append(F.round(F.mean("duration"), 1).alias("duration_avg"))
+
+    global_stats = df.agg(*agg_base).collect()[0]
+    has_duration = "duration" in df.columns
+    duration_avg = float(global_stats["duration_avg"] or 0) if has_duration else None
 
     genres_df = (
         df.groupBy("genres").count()
@@ -85,12 +112,7 @@ def load_data():
         .limit(12)
         .toPandas()
     )
-    genres_df["pct"] = (genres_df["count"] / total_tracks * 100).round(1)
-
-    tempo_buckets = _build_tempo_buckets(df)
-    stats_by_genre = _build_stats_by_genre(df)
-
-    global_feature_stats = _build_global_feature_stats(df)
+    genres_df["pct"] = (genres_df["count"] / total_tracks * 100).round(1) if total_tracks else 0
 
     return {
         "total": total_tracks,
@@ -98,9 +120,9 @@ def load_data():
         "n_genres": int(global_stats["n_genres"] or 0),
         "duration_avg": duration_avg,
         "genres_df": genres_df,
-        "tempo_buckets": tempo_buckets,
-        "stats": stats_by_genre,
-        "feature_stats": global_feature_stats,
+        "tempo_buckets": _build_tempo_buckets(df),
+        "stats": _build_stats_by_genre(df),
+        "feature_stats": _build_global_feature_stats(df),
     }
 
 @st.cache_resource
@@ -205,50 +227,117 @@ def predict_genre(track_feats: dict) -> list[tuple[str, float]] | None:
 # Filtres sidebar
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_sidebar_filters(d):
-    all_genres = sorted(d["genres_df"]["genres"].tolist())
+def render_sidebar_filters(df_raw, meta):
+    """
+    Affiche les filtres dans la sidebar.
+    Applique les filtres Spark sur df_raw, recalcule les agrégats et retourne
+    un dict complet prêt à être passé à render_global_stats_section.
+    """
+    import datetime
+
+    all_user_ids = meta["user_ids"]
+
+    def _to_date(val):
+        if val is None:
+            return datetime.date.today()
+        if isinstance(val, datetime.datetime):
+            return val.date()
+        if isinstance(val, datetime.date):
+            return val
+        return datetime.date.fromisoformat(str(val)[:10])
+
+    global_date_min = _to_date(meta["uploaded_at_min"])
+    global_date_max = _to_date(meta["uploaded_at_max"])
 
     with st.sidebar:
         st.header("🎛️ Filtres — stats globales")
 
+        # ── Genres ────────────────────────────────────────────────────────────
+        all_genres_raw = sorted(
+            [r[0] for r in df_raw.select("genres").distinct().collect() if r[0] is not None]
+        )
         selected_genres = st.multiselect(
             "Genres",
-            options=all_genres,
+            options=all_genres_raw,
             default=[],
             placeholder="Tous les genres",
         )
 
+        # ── Utilisateurs ──────────────────────────────────────────────────────
+        selected_users = st.multiselect(
+            "Utilisateurs (user_id)",
+            options=all_user_ids,
+            default=[],
+            placeholder="Tous les utilisateurs",
+        )
+
+        # ── Plage de dates d'upload ────────────────────────────────────────────
+        st.markdown("**Date d'upload**")
+        date_from = st.date_input(
+            "Du",
+            value=global_date_min,
+            min_value=global_date_min,
+            max_value=global_date_max,
+            key="date_from",
+        )
+        date_to = st.date_input(
+            "Au",
+            value=global_date_max,
+            min_value=global_date_min,
+            max_value=global_date_max,
+            key="date_to",
+        )
+        if date_from > date_to:
+            st.warning("⚠️ La date de début est postérieure à la date de fin.")
+
+        # ── Durée ─────────────────────────────────────────────────────────────
         duration_filter = None
-        if d["duration_avg"] is not None:
-            dur_min, dur_max = 0, int(d["duration_avg"] * 3)
+        if meta["has_duration"]:
+            # Borne max estimée à partir de la durée moyenne globale
+            dur_max_hint = int((meta.get("duration_avg_hint") or 300) * 3)
             duration_filter = st.slider(
                 "Durée (secondes)",
-                min_value=dur_min,
-                max_value=dur_max,
-                value=(dur_min, dur_max),
+                min_value=0,
+                max_value=dur_max_hint,
+                value=(0, dur_max_hint),
                 step=10,
             )
 
-        if selected_genres or duration_filter is not None:
-            st.caption("Les graphiques ci-contre reflètent les filtres actifs.")
-        else:
-            st.caption("Aucun filtre actif — affichage complet.")
+        active = any([selected_genres, selected_users,
+                      date_from > global_date_min, date_to < global_date_max,
+                      duration_filter and duration_filter != (0, duration_filter[1])])
+        st.caption("Les graphiques ci-contre reflètent les filtres actifs." if active
+                   else "Aucun filtre actif — affichage complet.")
 
-    genres_df = d["genres_df"].copy()
-    stats = d["stats"].copy()
-    tempo_df = d["tempo_buckets"].copy()
-
+    # ── Application des filtres Spark ────────────────────────────────────────
+    df = df_raw
     if selected_genres:
-        genres_df = genres_df[genres_df["genres"].isin(selected_genres)]
-        stats = stats[stats["genres"].isin(selected_genres)]
+        df = df.filter(F.col("genres").isin(selected_genres))
+    if selected_users:
+        df = df.filter(F.col("user_id").isin(selected_users))
+    if date_from != global_date_min:
+        df = df.filter(F.col("uploaded_at") >= str(date_from))
+    if date_to != global_date_max:
+        df = df.filter(F.col("uploaded_at") <= str(date_to))
+    if duration_filter and "duration" in df.columns:
+        df = df.filter(
+            (F.col("duration") >= duration_filter[0]) &
+            (F.col("duration") <= duration_filter[1])
+        )
 
-    return {
-        "genres_df": genres_df,
-        "stats": stats,
-        "tempo_buckets": tempo_df,
-        "selected_genres": selected_genres,
-        "duration_filter": duration_filter,
-    }
+    # ── Recalcul des agrégats sur le sous-ensemble filtré ────────────────────
+    with st.spinner("Mise à jour des statistiques…"):
+        d = compute_aggregates(df)
+
+    # Infos filtres actifs pour le bandeau
+    d["_selected_users"] = selected_users
+    d["_date_from"] = date_from
+    d["_date_to"] = date_to
+    d["_global_date_min"] = global_date_min
+    d["_global_date_max"] = global_date_max
+
+    return d
+
     
 def show_track_feats(track_feats, feat_stats, stats):
     st.success("Features extraites ✔")
@@ -606,33 +695,51 @@ def _analyse_single_track(path, music_name):
 # Section : STREAMLIT — affichage des stats globales et graphiques
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_global_stats_section(d, filtered):
+def render_global_stats_section(d):
     """Affiche les métriques et graphiques globaux (avec filtres appliqués)."""
-    genres_df = filtered["genres_df"]
-    stats = filtered["stats"]
-    tempo_df = filtered["tempo_buckets"]
-
     st.header("Statistiques globales du dataset")
     st.divider()
+
+    _render_active_filters_banner(
+        d.get("_selected_users", []),
+        d.get("_date_from"),
+        d.get("_date_to"),
+        d.get("_global_date_min"),
+        d.get("_global_date_max"),
+    )
 
     _render_kpi_row(d)
     st.divider()
 
     col1, col2 = st.columns(2)
     with col1:
-        _chart_genres(genres_df)
+        _chart_genres(d["genres_df"])
     with col2:
-        _chart_tempo(tempo_df)
+        _chart_tempo(d["tempo_buckets"])
 
     col3, col4 = st.columns(2)
     with col3:
-        _chart_centroid(stats)
+        _chart_centroid(d["stats"])
     with col4:
-        _chart_rms(stats)
+        _chart_rms(d["stats"])
 
-    _chart_mfcc_radar(stats)
-    _chart_zcr_flatness(stats)
-    _render_summary_table(stats)
+    _chart_mfcc_radar(d["stats"])
+    _chart_zcr_flatness(d["stats"])
+    _render_summary_table(d["stats"])
+
+
+def _render_active_filters_banner(selected_users, date_from, date_to, global_date_min, global_date_max):
+    """Affiche un bandeau résumant les filtres user_id et date actifs."""
+    if not date_from or not date_to:
+        return
+    parts = []
+    if selected_users:
+        parts.append(f"👤 **Utilisateurs :** {', '.join(str(u) for u in selected_users)}")
+    if date_from != global_date_min or date_to != global_date_max:
+        parts.append(f"📅 **Période :** {date_from} → {date_to}")
+    if parts:
+        st.info("  \n".join(parts))
+
 
 def _render_kpi_row(d):
     c1, c2, c3, c4 = st.columns(4)
@@ -781,11 +888,11 @@ def main():
     st.caption("Analyse des features ML extraites par Spark")
 
     with st.spinner("Chargement des données Spark..."):
-        d = load_data()
+        df_raw, meta = load_raw()
 
-    filtered = render_sidebar_filters(d)
+    d = render_sidebar_filters(df_raw, meta)
     render_track_analysis_section(d)
-    render_global_stats_section(d, filtered)
+    render_global_stats_section(d)
 
 
 if __name__ == "__main__":
