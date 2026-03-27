@@ -44,10 +44,14 @@ COLORS = px.colors.qualitative.D3
 
 @st.cache_resource
 def get_spark():
-    spark = SparkSession.builder.getOrCreate()
-    spark.sparkContext.setLogLevel("ERROR")
+    spark = (
+        SparkSession.builder
+        .appName("music-dashboard")
+        .config("spark.network.timeout", "300s")
+        .config("spark.executor.heartbeatInterval", "60s")
+        .getOrCreate()
+    )
     return spark
-
 
 @st.cache_resource
 def load_raw():
@@ -710,8 +714,8 @@ def _render_history_section(d):
         )
         show_track_feats(track_feats, d["feature_stats"], d["stats"])
 
-
 def _analyse_single_track(path, music_name):
+    print("START analyse:", path)
     spark = get_spark()
     abs_path = os.path.abspath(path)
     file_uri = f"file://{abs_path}"
@@ -722,18 +726,17 @@ def _analyse_single_track(path, music_name):
         .select("f.*")
         .withColumn("filename", F.lit(music_name or "Unknown Track"))
     )
-
+    
     feat_df.write.mode("append").parquet("data/features/history_features")
 
-    result_df = feat_df.toPandas()
-    if result_df.empty or int(result_df.iloc[0]["ok"]) != 1:
+    row = feat_df.limit(1).toPandas()
+    if row is None or int(row["ok"]) != 1:
         st.error("L'UDF Spark a retourné ok=0 — vérifiez librosa.")
         return None
 
-    result = result_df.iloc[0].to_dict()
+    result = row.iloc[0].to_dict()
     result.pop("ok", None)
     return result
-
 
 def render_global_stats_section(d):
     st.header("Statistiques globales du dataset")
