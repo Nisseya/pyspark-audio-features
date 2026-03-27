@@ -36,7 +36,7 @@ spark = (
 )
 spark.sparkContext.setLogLevel("ERROR")
 
-df = spark.read.parquet("./data/features_training_dataset_dataset.parquet")
+df = spark.read.parquet("./data/features/training_dataset")
 
 df = (
     df

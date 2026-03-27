@@ -26,7 +26,7 @@ if os.getenv("CESTQUIQUIADESPROBLEMESAVECSPARK") == "Leo":
 
 warnings.filterwarnings("ignore")
 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.ml import PipelineModel
 
@@ -36,14 +36,11 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from utils.extract_all_concise import extract_udf
 
 COLORS = px.colors.qualitative.D3
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Spark helpers
-# ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
 def get_spark():
@@ -51,17 +48,11 @@ def get_spark():
     spark.sparkContext.setLogLevel("ERROR")
     return spark
 
+
 @st.cache_resource
 def load_raw():
-    """
-    Charge le Parquet UNE seule fois et le met en cache comme ressource Spark.
-    Retourne (df_exploded, meta) où meta contient les valeurs fixes pour la sidebar
-    (liste des user_ids, plage de dates globale).
-    Le DataFrame retourné a déjà la colonne 'genres' normalisée (explodée ou renommée).
-    """
     spark = get_spark()
-    out_path = "./data/features/training_dataset"
-    df = spark.read.parquet(out_path)
+    df = spark.read.parquet("./data/features/training_dataset")
 
     genre_col = "genre" if "genre" in df.columns else "genres"
     if genre_col == "genres":
@@ -69,15 +60,19 @@ def load_raw():
     else:
         df = df.withColumnRenamed("genre", "genres")
 
-    # Valeurs fixes pour alimenter les contrôles sidebar (calculées une seule fois)
-    user_ids = sorted(
-        [r[0] for r in df.select("user_id").distinct().collect() if r[0] is not None]
+    user_ids = (
+        df.select("user_id")
+        .distinct()
+        .filter(F.col("user_id").isNotNull())
+        .orderBy("user_id")
+        .toPandas()["user_id"]
+        .tolist()
     )
-    
+
     date_range = df.agg(
         F.min("uploaded_at").alias("date_min"),
         F.max("uploaded_at").alias("date_max"),
-    ).collect()[0]
+    ).toPandas().iloc[0]
 
     meta = {
         "user_ids": user_ids,
@@ -89,10 +84,6 @@ def load_raw():
 
 
 def compute_aggregates(df):
-    """
-    Calcule tous les KPI et agrégats sur le DataFrame (éventuellement filtré).
-    Appelée à chaque interaction — pas de @st.cache_data ici.
-    """
     total_tracks = df.count()
 
     agg_base = [
@@ -102,32 +93,24 @@ def compute_aggregates(df):
     if "duration" in df.columns:
         agg_base.append(F.round(F.mean("duration"), 1).alias("duration_avg"))
 
-    global_stats = df.agg(*agg_base).collect()[0]
+    global_stats = df.agg(*agg_base).toPandas().iloc[0]
     has_duration = "duration" in df.columns
     duration_avg = float(global_stats["duration_avg"] or 0) if has_duration else None
-
-    genres_df = (
-        df.groupBy("genres").count()
-        .orderBy("count", ascending=False)
-        .limit(12)
-        .toPandas()
-    )
-    genres_df["pct"] = (genres_df["count"] / total_tracks * 100).round(1) if total_tracks else 0
 
     return {
         "total": total_tracks,
         "tempo_mean": float(global_stats["tempo_mean"] or 0),
         "n_genres": int(global_stats["n_genres"] or 0),
         "duration_avg": duration_avg,
-        "genres_df": genres_df,
+        "genres_df": _build_genres_df(df, total_tracks),
         "tempo_buckets": _build_tempo_buckets(df),
         "stats": _build_stats_by_genre(df),
+        "zcr_flatness": _build_zcr_flatness_with_percentile(df),
         "feature_stats": _build_global_feature_stats(df),
     }
 
 @st.cache_resource
 def load_model():
-    """Charge le modèle RF depuis le disque. Retourne None si absent."""
     model_path = "data/model/rf_pipeline"
     if not os.path.exists(model_path):
         return None
@@ -137,8 +120,49 @@ def load_model():
         st.warning(f"Impossible de charger le modèle : {e}")
         return None
 
+
+def _build_genres_df(df, total_tracks):
+    w_rank  = Window.orderBy(F.col("count").desc())
+    w_cumul = Window.orderBy(F.col("count").desc()).rowsBetween(
+        Window.unboundedPreceding, Window.currentRow
+    )
+
+    genres_df = (
+        df.groupBy("genres").count()
+        .withColumn("rank",      F.rank().over(w_rank))
+        .withColumn("cumul_pct", F.round(
+            F.sum("count").over(w_cumul) / total_tracks * 100, 1
+        ))
+        .orderBy("rank")
+        .limit(12)
+        .toPandas()
+    )
+    genres_df["pct"] = (
+        genres_df["count"] / total_tracks * 100
+    ).round(1) if total_tracks else 0
+
+    return genres_df
+
+
 def _build_tempo_buckets(df):
-    bucket_order = ["< 80","80-100","100-110","110-120","120-130","130-140","140-160","160+"]
+    bucket_order = ["< 80", "80-100", "100-110", "110-120", "120-130", "130-140", "140-160", "160+"]
+
+    bucket_sort = (
+        F.when(F.col("bucket") == "< 80",    0)
+         .when(F.col("bucket") == "80-100",  1)
+         .when(F.col("bucket") == "100-110", 2)
+         .when(F.col("bucket") == "110-120", 3)
+         .when(F.col("bucket") == "120-130", 4)
+         .when(F.col("bucket") == "130-140", 5)
+         .when(F.col("bucket") == "140-160", 6)
+         .otherwise(7)
+    )
+
+    w_cumul = Window.orderBy(bucket_sort).rowsBetween(
+        Window.unboundedPreceding, Window.currentRow
+    )
+    w_total = Window.partitionBy(F.lit(1))
+
     tempo_buckets = (
         df.withColumn("bucket",
             F.when(F.col("tempo") < 80,  "< 80")
@@ -150,15 +174,23 @@ def _build_tempo_buckets(df):
              .when(F.col("tempo") < 160, "140-160")
              .otherwise("160+"))
         .groupBy("bucket").count()
+        .withColumn("cumul",     F.sum("count").over(w_cumul))
+        .withColumn("cumul_pct", F.round(
+            F.col("cumul") / F.sum("count").over(w_total) * 100, 1
+        ))
+        .orderBy(bucket_sort)
         .toPandas()
     )
+
     tempo_buckets["bucket"] = pd.Categorical(
         tempo_buckets["bucket"], categories=bucket_order, ordered=True
     )
-    return tempo_buckets.sort_values("bucket")
+    return tempo_buckets
 
 
 def _build_stats_by_genre(df):
+    w_global = Window.partitionBy(F.lit(1))
+
     agg_exprs = [
         F.round(F.mean("tempo"), 1).alias("tempo"),
         F.round(F.mean("centroid_mean"), 0).alias("centroid"),
@@ -174,10 +206,44 @@ def _build_stats_by_genre(df):
     ]
     if "duration" in df.columns:
         agg_exprs.append(F.round(F.mean("duration"), 1).alias("duration_avg"))
+
     return (
         df.groupBy("genres").agg(*agg_exprs)
         .orderBy("count", ascending=False)
         .limit(12)
+        .withColumn("global_centroid_avg", F.avg("centroid").over(w_global))
+        .withColumn("global_centroid_std", F.stddev("centroid").over(w_global))
+        .withColumn("z_centroid", F.round(
+            (F.col("centroid") - F.col("global_centroid_avg"))
+            / F.col("global_centroid_std"), 2
+        ))
+        .withColumn("global_rms_avg", F.avg("rms").over(w_global))
+        .withColumn("global_rms_std", F.stddev("rms").over(w_global))
+        .withColumn("z_rms", F.round(
+            (F.col("rms") - F.col("global_rms_avg"))
+            / F.col("global_rms_std"), 2
+        ))
+        .drop("global_centroid_avg", "global_centroid_std", "global_rms_avg", "global_rms_std")
+        .toPandas()
+        .fillna(0)
+    )
+
+
+def _build_zcr_flatness_with_percentile(df):
+    w_zcr = Window.orderBy("zcr")
+    w_flatness = Window.orderBy("flatness")
+
+    return (
+        df.groupBy("genres").agg(
+            F.round(F.mean("zcr_mean"), 4).alias("zcr"),
+            F.round(F.mean("flatness_mean"), 5).alias("flatness"),
+            F.count("*").alias("count"),
+        )
+        .orderBy("count", ascending=False)
+        .limit(12)
+        .withColumn("pct_rank_zcr", F.round(F.percent_rank().over(w_zcr),      3))
+        .withColumn("pct_rank_flatness", F.round(F.percent_rank().over(w_flatness), 3))
+        .withColumn("noise_score", F.round((F.col("pct_rank_zcr") + F.col("pct_rank_flatness")) / 2, 3))
         .toPandas()
         .fillna(0)
     )
@@ -197,13 +263,13 @@ def _build_global_feature_stats(df):
         ]
     return df.agg(*agg_exprs).toPandas().iloc[0].to_dict()
 
+
 def predict_genre(track_feats: dict) -> list[tuple[str, float]] | None:
     model = load_model()
     if model is None:
         return None
 
     spark = get_spark()
-
     assembler = model.stages[1]
     rf_model = model.stages[2]
     indexer = model.stages[0]
@@ -212,30 +278,18 @@ def predict_genre(track_feats: dict) -> list[tuple[str, float]] | None:
     feature_cols = assembler.getInputCols()
     row_data = {col: float(track_feats.get(col, 0.0)) for col in feature_cols}
     row_df = spark.createDataFrame([row_data])
-
     row_df = assembler.transform(row_df)
-    pred_row = rf_model.transform(row_df).first()
 
-    if pred_row is None:
+    pred_pd = rf_model.transform(row_df).toPandas()
+    if pred_pd.empty:
         return None
 
-    proba_vec = pred_row["probability"].toArray()
-    top3_idx = proba_vec.argsort()[::-1][:3]
+    proba_vec = pred_pd.iloc[0]["probability"].toArray()
+    top3_idx  = proba_vec.argsort()[::-1][:3]
     return [(label_names[i], float(proba_vec[i])) for i in top3_idx]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Filtres sidebar
-# ══════════════════════════════════════════════════════════════════════════════
-
 def render_sidebar_filters(df_raw, meta):
-    """
-    Affiche les filtres dans la sidebar.
-    Applique les filtres Spark sur df_raw, recalcule les agrégats et retourne
-    un dict complet prêt à être passé à render_global_stats_section.
-    """
     import datetime
-
-    all_user_ids = meta["user_ids"]
 
     def _to_date(val):
         if val is None:
@@ -252,10 +306,15 @@ def render_sidebar_filters(df_raw, meta):
     with st.sidebar:
         st.header("🎛️ Filtres — stats globales")
 
-        # ── Genres ────────────────────────────────────────────────────────────
-        all_genres_raw = sorted(
-            [r[0] for r in df_raw.select("genres").distinct().collect() if r[0] is not None]
+        all_genres_raw = (
+            df_raw.select("genres")
+            .distinct()
+            .filter(F.col("genres").isNotNull())
+            .orderBy("genres")
+            .toPandas()["genres"]
+            .tolist()
         )
+
         selected_genres = st.multiselect(
             "Genres",
             options=all_genres_raw,
@@ -263,15 +322,13 @@ def render_sidebar_filters(df_raw, meta):
             placeholder="Tous les genres",
         )
 
-        # ── Utilisateurs ──────────────────────────────────────────────────────
         selected_users = st.multiselect(
             "Utilisateurs (user_id)",
-            options=all_user_ids,
+            options=meta["user_ids"],
             default=[],
             placeholder="Tous les utilisateurs",
         )
 
-        # ── Plage de dates d'upload ────────────────────────────────────────────
         st.markdown("**Date d'upload**")
         date_from = st.date_input(
             "Du",
@@ -290,10 +347,8 @@ def render_sidebar_filters(df_raw, meta):
         if date_from > date_to:
             st.warning("⚠️ La date de début est postérieure à la date de fin.")
 
-        # ── Durée ─────────────────────────────────────────────────────────────
         duration_filter = None
         if meta["has_duration"]:
-            # Borne max estimée à partir de la durée moyenne globale
             dur_max_hint = int((meta.get("duration_avg_hint") or 300) * 3)
             duration_filter = st.slider(
                 "Durée (secondes)",
@@ -303,13 +358,9 @@ def render_sidebar_filters(df_raw, meta):
                 step=10,
             )
 
-        active = any([selected_genres, selected_users,
-                      date_from > global_date_min, date_to < global_date_max,
-                      duration_filter and duration_filter != (0, duration_filter[1])])
-        st.caption("Les graphiques ci-contre reflètent les filtres actifs." if active
-                   else "Aucun filtre actif — affichage complet.")
+        active = any([selected_genres, selected_users, date_from > global_date_min, date_to < global_date_max, duration_filter and duration_filter != (0, duration_filter[1])])
+        st.caption("Les graphiques ci-contre reflètent les filtres actifs." if active else "Aucun filtre actif — affichage complet.")
 
-    # ── Application des filtres Spark ────────────────────────────────────────
     df = df_raw
     if selected_genres:
         df = df.filter(F.col("genres").isin(selected_genres))
@@ -325,11 +376,9 @@ def render_sidebar_filters(df_raw, meta):
             (F.col("duration") <= duration_filter[1])
         )
 
-    # ── Recalcul des agrégats sur le sous-ensemble filtré ────────────────────
     with st.spinner("Mise à jour des statistiques…"):
         d = compute_aggregates(df)
 
-    # Infos filtres actifs pour le bandeau
     d["_selected_users"] = selected_users
     d["_date_from"] = date_from
     d["_date_to"] = date_to
@@ -338,10 +387,9 @@ def render_sidebar_filters(df_raw, meta):
 
     return d
 
-    
+
 def show_track_feats(track_feats, feat_stats, stats):
     st.success("Features extraites ✔")
-
     _render_genre_prediction(track_feats)
     _render_track_kpis(track_feats)
     _render_bullet_charts(track_feats, feat_stats)
@@ -349,30 +397,30 @@ def show_track_feats(track_feats, feat_stats, stats):
     _render_chromagram(track_feats)
     _render_tonnetz_contrast(track_feats)
     st.divider()
-    
+
+
 def _render_genre_prediction(track_feats: dict) -> None:
-    """Affiche la prédiction du genre en haut de l'analyse de piste."""
     results = predict_genre(track_feats)
- 
+
     if results is None:
         st.info(
             "ℹ️ Modèle non disponible — entraîne-le d'abord avec `train_model.py`. "
             "Le chemin attendu : `data/model/rf_pipeline`."
         )
         return
- 
+
     st.markdown("#### 🤖 Prédiction du genre par le modèle")
- 
     top_genre, top_proba = results[0]
     st.success(f"**Genre prédit : {top_genre}** — confiance {top_proba:.1%}")
- 
+
     cols = st.columns(3)
     for i, (genre, proba) in enumerate(results):
         with cols[i]:
             st.metric(f"#{i+1}", genre, f"{proba:.1%}")
             st.progress(proba)
- 
+
     st.divider()
+
 
 def _render_track_kpis(track_feats):
     st.markdown("#### 📊 Features de ta piste")
@@ -383,6 +431,7 @@ def _render_track_kpis(track_feats):
     k4.metric("RMS", f"{track_feats['rms_mean']:.4f}")
     k5.metric("ZCR", f"{track_feats['zcr_mean']:.4f}")
 
+
 def _render_bullet_charts(track_feats, feat_stats):
     st.markdown("#### 🔍 Ta piste dans le contexte du dataset")
     st.write(
@@ -392,7 +441,7 @@ def _render_bullet_charts(track_feats, feat_stats):
 
     compare_cfg = [
         ("Tempo (bpm)", "tempo", "{:.1f} bpm"),
-        ("Centroid (Hz)", "centroid_mean", "{:.0f} Hz"),
+        ("Centroid (Hz)","centroid_mean", "{:.0f} Hz"),
         ("RMS", "rms_mean", "{:.4f}"),
         ("ZCR", "zcr_mean", "{:.4f}"),
         ("Flatness", "flatness_mean", "{:.5f}"),
@@ -454,7 +503,8 @@ def _render_mfcc_radar(track_feats: dict, stats: pd.DataFrame) -> None:
     fig_cmp = go.Figure()
 
     for i, row in top6.iterrows():
-        vals = [row["mfcc1"], row["mfcc2"], row["mfcc3"], row["mfcc4"], row["mfcc5"]] + [row["mfcc1"]]
+        vals = [row["mfcc1"], row["mfcc2"], row["mfcc3"],
+                row["mfcc4"], row["mfcc5"]] + [row["mfcc1"]]
         fig_cmp.add_trace(go.Scatterpolar(
             r=vals, theta=mfcc_labels,
             fill="toself", opacity=0.22, name=row["genres"],
@@ -513,7 +563,7 @@ def _render_tonnetz_contrast(track_feats: dict) -> None:
                 labels={"x": "", "y": "Valeur moyenne"},
                 color=tn_vals, color_continuous_scale="RdBu_r",
             )
-            fig_tn.update_layout(coloraxis_showscale=False, height=260, margin=dict(l=0,r=0,t=10,b=0))
+            fig_tn.update_layout(coloraxis_showscale=False, height=260, margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig_tn, use_container_width=True)
 
         with t2:
@@ -525,16 +575,11 @@ def _render_tonnetz_contrast(track_feats: dict) -> None:
                 labels={"x": "", "y": "Contraste moyen"},
                 color=ct_vals, color_continuous_scale="Viridis",
             )
-            fig_ct.update_layout(coloraxis_showscale=False, height=260, margin=dict(l=0,r=0,t=10,b=0))
+            fig_ct.update_layout(coloraxis_showscale=False, height=260, margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig_ct, use_container_width=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Section : Input audio (upload / YouTube / historique)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def render_track_analysis_section(d: dict) -> None:
-    """Gère l'input audio et lance l'analyse si un fichier est disponible."""
     st.divider()
     st.header("Analyse ta propre piste")
     st.divider()
@@ -550,29 +595,25 @@ def render_track_analysis_section(d: dict) -> None:
         label_visibility="collapsed",
     )
 
-    audio_path = None
-    music_name = None
+    audio_path  = None
+    music_name  = None
     track_feats = None
 
     if input_mode == "Fichier MP3":
         audio_path, music_name = _input_mp3()
-
     elif input_mode == "URL YouTube":
         audio_path, music_name = _input_youtube()
-
     elif input_mode == "Historique des musiques téléchargées":
         _render_history_section(d)
         return
-    
+
     if audio_path:
         with st.spinner("Extraction des features audio…"):
             track_feats = _analyse_single_track(audio_path, music_name)
             if track_feats is not None:
                 import librosa as _librosa
                 _librosa.load(audio_path, sr=None, mono=True, duration=60)
-                track_feats["duration"] = float(
-                    _librosa.get_duration(path=audio_path)
-                )
+                track_feats["duration"] = float(_librosa.get_duration(path=audio_path))
 
         if track_feats is not None:
             show_track_feats(track_feats, d["feature_stats"], d["stats"])
@@ -595,6 +636,7 @@ def _input_mp3():
         path = tmp.name
     st.success(f"Fichier chargé : `{uploaded.name}`")
     return path, uploaded.name
+
 
 def _input_youtube():
     yt_url = st.text_input("URL YouTube", placeholder="https://www.youtube.com/watch?v=...")
@@ -636,22 +678,24 @@ def _input_youtube():
             st.error("Timeout — vidéo trop longue ou connexion lente.")
     return None, None
 
+
 def _render_history_section(d):
     st.header("Historique des musiques téléchargées")
     history_path = "data/features/history_features"
     spark = get_spark()
 
-    history_feats_df = None
-    if os.path.exists(history_path):
-        history_feats_df = spark.read.parquet(history_path)
-        if not history_feats_df.head(1):
-            st.warning("Aucune musique dans l'historique.")
-            return
-        st.success(f"{history_feats_df.count()} pistes chargées depuis l'historique.")
-    else:
+    if not os.path.exists(history_path):
         st.warning("Pas de fichier `history_features.parquet` trouvé.")
         return
 
+    history_feats_df = spark.read.parquet(history_path)
+    count = history_feats_df.count()
+
+    if count == 0:
+        st.warning("Aucune musique dans l'historique.")
+        return
+
+    st.success(f"{count} pistes chargées depuis l'historique.")
     track_names = history_feats_df.toPandas()["filename"].tolist()
     selected_track = st.selectbox("Choisis une piste à afficher", track_names, index=0)
 
@@ -660,14 +704,14 @@ def _render_history_section(d):
             history_feats_df
             .filter(F.col("filename") == selected_track)
             .withColumn("duration", F.lit(3005))
-            .first()
-            .asDict()
+            .toPandas()
+            .iloc[0]
+            .to_dict()
         )
         show_track_feats(track_feats, d["feature_stats"], d["stats"])
 
 
 def _analyse_single_track(path, music_name):
-    """Lance l'UDF Spark sur un fichier local et persiste le résultat."""
     spark = get_spark()
     abs_path = os.path.abspath(path)
     file_uri = f"file://{abs_path}"
@@ -681,22 +725,17 @@ def _analyse_single_track(path, music_name):
 
     feat_df.write.mode("append").parquet("data/features/history_features")
 
-    row = feat_df.first()
-    if row is None or int(row["ok"]) != 1:
+    result_df = feat_df.toPandas()
+    if result_df.empty or int(result_df.iloc[0]["ok"]) != 1:
         st.error("L'UDF Spark a retourné ok=0 — vérifiez librosa.")
         return None
 
-    result = row.asDict()
+    result = result_df.iloc[0].to_dict()
     result.pop("ok", None)
     return result
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Section : STREAMLIT — affichage des stats globales et graphiques
-# ══════════════════════════════════════════════════════════════════════════════
-
 def render_global_stats_section(d):
-    """Affiche les métriques et graphiques globaux (avec filtres appliqués)."""
     st.header("Statistiques globales du dataset")
     st.divider()
 
@@ -724,12 +763,11 @@ def render_global_stats_section(d):
         _chart_rms(d["stats"])
 
     _chart_mfcc_radar(d["stats"])
-    _chart_zcr_flatness(d["stats"])
+    _chart_zcr_flatness(d["zcr_flatness"])
     _render_summary_table(d["stats"])
 
 
 def _render_active_filters_banner(selected_users, date_from, date_to, global_date_min, global_date_max):
-    """Affiche un bandeau résumant les filtres user_id et date actifs."""
     if not date_from or not date_to:
         return
     parts = []
@@ -743,96 +781,178 @@ def _render_active_filters_banner(selected_users, date_from, date_to, global_dat
 
 def _render_kpi_row(d):
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Pistes totales",   f"{d['total']:,}")
-    c2.metric("Durée moyenne",    f"{d['duration_avg']:.0f} s" if d["duration_avg"] else "—")
+    c1.metric("Pistes totales",f"{d['total']:,}")
+    c2.metric("Durée moyenne", f"{d['duration_avg']:.0f} s" if d["duration_avg"] else "—")
     c3.metric("Genres distincts", str(d["n_genres"]))
-    c4.metric("Tempo moyen",      f"{d['tempo_mean']} bpm")
+    c4.metric("Tempo moyen", f"{d['tempo_mean']} bpm")
+
 
 def _chart_genres(genres_df):
     st.subheader("Genres les plus présents")
     st.write(
-        "Répartition des pistes par genre dans le dataset. "
-        "Un déséquilibre marqué entre genres peut biaiser un modèle de classification — "
-        "à surveiller avant l'entraînement."
+        "Répartition des pistes par genre. "
+        "La courbe orange indique la **part cumulative** : "
+        "les N premiers genres représentent X % du dataset "
+        "(calculé avec `SUM OVER ORDER BY count DESC`)."
     )
-    fig = px.bar(
-        genres_df,
-        x="count", y="genres", orientation="h",
-        text=genres_df["pct"].apply(lambda x: f"{x}%"),
-        color="genres", color_discrete_sequence=COLORS,
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Bar(
+            x=genres_df["genres"],
+            y=genres_df["count"],
+            text=genres_df["pct"].apply(lambda x: f"{x}%"),
+            textposition="outside",
+            marker_color=COLORS[: len(genres_df)],
+            name="Pistes",
+            showlegend=False,
+        ),
+        secondary_y=False,
     )
+
+    fig.add_trace(
+        go.Scatter(
+            x=genres_df["genres"],
+            y=genres_df["cumul_pct"],
+            mode="lines+markers+text",
+            text=genres_df["cumul_pct"].apply(lambda x: f"{x}%"),
+            textposition="top center",
+            line=dict(color="#FF7F0E", width=2, dash="dot"),
+            marker=dict(size=7),
+            name="Cumul %",
+        ),
+        secondary_y=True,
+    )
+
+    fig.update_yaxes(title_text="Nombre de pistes", secondary_y=False)
+    fig.update_yaxes(title_text="Part cumulative (%)", range=[0, 115],
+                     secondary_y=True, showgrid=False)
     fig.update_layout(
-        showlegend=False, yaxis=dict(autorange="reversed"),
-        margin=dict(l=0, r=0, t=10, b=0), height=380,
-        xaxis_title="Nombre de pistes", yaxis_title="",
+        showlegend=True,
+        legend=dict(orientation="h", y=1.12),
+        margin=dict(l=0, r=0, t=30, b=0),
+        height=400,
+        xaxis_title="",
     )
-    fig.update_traces(textposition="outside")
     st.plotly_chart(fig, use_container_width=True)
+
 
 def _chart_tempo(tempo_df):
     st.subheader("Distribution des tempos")
     st.write(
         "Nombre de pistes par tranche de BPM. "
-        "Un pic autour de 120–130 BPM est typique des datasets pop/electronic. "
-        "Le tempo est l'une des features les plus discriminantes pour séparer "
-        "genres lents (jazz, classique) et rapides (metal, drum & bass)."
+        "La courbe bleue montre le **cumul progressif** : "
+        "à partir de quelle tranche on a couvert 50 %, 80 %… du dataset "
+        "(window `SUM ROWS UNBOUNDED PRECEDING`)."
     )
-    fig = px.bar(
-        tempo_df, x="bucket", y="count",
-        color_discrete_sequence=["#3266ad"],
-        labels={"bucket": "BPM", "count": "Pistes"},
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Bar(
+            x=tempo_df["bucket"].astype(str),
+            y=tempo_df["count"],
+            marker_color="#3266ad",
+            name="Pistes",
+            showlegend=False,
+        ),
+        secondary_y=False,
     )
-    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=380)
+
+    fig.add_trace(
+        go.Scatter(
+            x=tempo_df["bucket"].astype(str),
+            y=tempo_df["cumul_pct"],
+            mode="lines+markers+text",
+            text=tempo_df["cumul_pct"].apply(lambda x: f"{x}%"),
+            textposition="top right",
+            line=dict(color="#17BECF", width=2),
+            marker=dict(size=7),
+            name="Cumul %",
+        ),
+        secondary_y=True,
+    )
+
+    fig.update_yaxes(title_text="Nombre de pistes", secondary_y=False)
+    fig.update_yaxes(title_text="Cumul (%)", range=[0, 115],
+                     secondary_y=True, showgrid=False)
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(orientation="h", y=1.12),
+        margin=dict(l=0, r=0, t=30, b=0),
+        height=400,
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
 def _chart_centroid(stats):
     st.subheader("Brillance spectrale par genre")
     st.write(
-        "Le **centroid spectral** est la moyenne pondérée des fréquences présentes dans le signal (en Hz). "
-        "Un centroid élevé = son aigu et brillant (cymbales, voix criarde). "
-        "Un centroid faible = son grave et chaud (basse, contrebasse). "
-        "Feature clé pour distinguer metal et classique."
+        "Centroid spectral moyen par genre. "
+        "La couleur indique le **z-score** par rapport à la moyenne de tous les genres "
+        "(window `AVG / STDDEV OVER ()`) : "
+        "🔴 rouge = plus brillant que la moyenne, 🔵 bleu = plus sombre."
     )
+
     fig = px.bar(
-        stats, x="genres", y="centroid",
-        color="genres", color_discrete_sequence=COLORS,
-        labels={"centroid": "Hz", "genres": ""},
+        stats,
+        x="genres", y="centroid",
+        color="z_centroid",
+        color_continuous_scale="RdBu_r",
+        color_continuous_midpoint=0,
+        labels={"centroid": "Hz", "genres": "", "z_centroid": "Z-score"},
+        text=stats["z_centroid"].apply(lambda z: f"z={z:+.2f}"),
     )
-    fig.update_layout(showlegend=False, margin=dict(l=0,r=0,t=10,b=0), height=340)
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        coloraxis_colorbar=dict(title="Z-score", thickness=12),
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=360,
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
 def _chart_rms(stats):
     st.subheader("Énergie RMS par genre")
     st.write(
-        "Le **RMS (Root Mean Square)** mesure l'énergie moyenne du signal — il correspond au volume perçu. "
-        "Metal et electronic sont typiquement les plus forts (compression forte, peu de dynamique). "
-        "Classique et jazz ont un RMS plus faible car ils exploitent toute la plage dynamique."
+        "RMS moyen par genre. "
+        "La couleur indique le **z-score** par rapport à la moyenne de tous les genres "
+        "(window `AVG / STDDEV OVER ()`) : "
+        "🔴 rouge = plus fort que la moyenne, 🔵 bleu = plus doux."
     )
+
     fig = px.bar(
-        stats, x="genres", y="rms",
-        color="genres", color_discrete_sequence=COLORS,
-        labels={"rms": "RMS", "genres": ""},
+        stats,
+        x="genres", y="rms",
+        color="z_rms",
+        color_continuous_scale="RdBu_r",
+        color_continuous_midpoint=0,
+        labels={"rms": "RMS", "genres": "", "z_rms": "Z-score"},
+        text=stats["z_rms"].apply(lambda z: f"z={z:+.2f}"),
     )
-    fig.update_layout(showlegend=False, margin=dict(l=0,r=0,t=10,b=0), height=340)
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        coloraxis_colorbar=dict(title="Z-score", thickness=12),
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=360,
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
 def _chart_mfcc_radar(stats):
     st.subheader("Profil timbral moyen par genre (MFCC 1–5)")
     st.write(
-        "Les **MFCC (Mel-Frequency Cepstral Coefficients)** capturent la forme du spectre sonore "
-        "telle que l'oreille humaine la perçoit. Les premiers coefficients décrivent l'enveloppe globale du timbre. "
-        "Des profils radar très différents entre genres signifient que ces features sont bien discriminantes — "
-        "bon signe pour la classification."
+        "Les **MFCC** capturent la forme du spectre sonore telle que l'oreille humaine la perçoit. "
+        "Des profils radar très différents entre genres signifient que ces features sont bien discriminantes."
     )
     top6 = stats.head(6)
     mfcc_labels = ["MFCC 1","MFCC 2","MFCC 3","MFCC 4","MFCC 5","MFCC 1"]
     fig_radar = go.Figure()
 
     for i, row in top6.iterrows():
-        vals = [row["mfcc1"], row["mfcc2"], row["mfcc3"], row["mfcc4"], row["mfcc5"]] + [row["mfcc1"]]
+        vals = [row["mfcc1"], row["mfcc2"], row["mfcc3"],
+                row["mfcc4"], row["mfcc5"]] + [row["mfcc1"]]
         fig_radar.add_trace(go.Scatterpolar(
             r=vals, theta=mfcc_labels,
             fill="toself", opacity=0.55, name=row["genres"],
@@ -848,39 +968,55 @@ def _chart_mfcc_radar(stats):
     st.plotly_chart(fig_radar, use_container_width=True)
 
 
-def _chart_zcr_flatness(stats):
+def _chart_zcr_flatness(zcr_flatness_df):
     st.subheader("Complexité harmonique — ZCR vs Spectral Flatness")
     st.write(
-        "Le **ZCR (Zero-Crossing Rate)** compte combien de fois par seconde le signal passe par zéro — "
-        "élevé pour les sons percussifs et bruités, faible pour les sons tonals. "
-        "La **Spectral Flatness** mesure si le spectre ressemble à du bruit blanc (valeur proche de 1) "
-        "ou à un son avec des harmoniques bien définies (valeur proche de 0). "
-        "Les genres en haut à droite sont bruités et peu structurés, ceux en bas à gauche sont tonals et mélodiques. "
-        "La taille des bulles représente le nombre de pistes."
+        "Chaque bulle est un genre. Sa couleur reflète un **score de bruit combiné** "
+        "calculé par `PERCENT_RANK() OVER` sur ZCR et Flatness séparément, puis moyenné. "
+        "🔴 rouge = genre bruité/percussif, 🔵 bleu = genre tonal/mélodique. "
+        "Le tooltip affiche le percentile exact sur chaque axe."
     )
-    fig_s = px.scatter(
-        stats,
-        x="zcr", y="flatness", text="genres",
+
+    fig = px.scatter(
+        zcr_flatness_df,
+        x="zcr", y="flatness",
+        text="genres",
         size="count", size_max=45,
-        color="genres", color_discrete_sequence=COLORS,
-        labels={"zcr": "ZCR moyen", "flatness": "Flatness moyen"},
+        color="noise_score",
+        color_continuous_scale="RdBu_r",
+        color_continuous_midpoint=0.5,
+        labels={
+            "zcr":         "ZCR moyen",
+            "flatness":    "Flatness moyen",
+            "noise_score": "Score bruit",
+        },
+        hover_data={
+            "pct_rank_zcr":      ":.0%",
+            "pct_rank_flatness": ":.0%",
+            "noise_score":       ":.0%",
+            "count":             True,
+        },
     )
-    fig_s.update_traces(textposition="top center")
-    fig_s.update_layout(showlegend=False, margin=dict(l=0,r=0,t=10,b=0), height=420)
-    st.plotly_chart(fig_s, use_container_width=True)
+    fig.update_traces(textposition="top center")
+    fig.update_layout(
+        coloraxis_colorbar=dict(title="Score bruit", thickness=12),
+        showlegend=False,
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=420,
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def _render_summary_table(stats):
     with st.expander("Tableau récapitulatif par genre"):
-        cols = ["genres","count","tempo","centroid","rms","zcr","flatness"]
-        renamed = {
-            "genres": "Genre", "count": "Pistes", "tempo": "Tempo (bpm)",
-            "centroid": "Centroid (Hz)", "rms": "RMS", "zcr": "ZCR", "flatness": "Flatness",
-        }
+        cols = ["genres","count","tempo","centroid","rms","zcr","flatness",
+                "z_centroid","z_rms"]
+        renamed = {"genres": "Genre", "count": "Pistes", "tempo": "Tempo (bpm)", "centroid": "Centroid (Hz)", "rms": "RMS", "zcr": "ZCR", "flatness": "Flatness", "z_centroid": "Z Centroid", "z_rms": "Z RMS",}
         st.dataframe(
             stats[cols].rename(columns=renamed).set_index("Genre"),
             use_container_width=True,
         )
+
 
 def main():
     st.set_page_config(page_title="Music Features Dashboard", layout="wide")
@@ -893,7 +1029,6 @@ def main():
     d = render_sidebar_filters(df_raw, meta)
     render_track_analysis_section(d)
     render_global_stats_section(d)
-
 
 if __name__ == "__main__":
     main()
