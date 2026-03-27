@@ -129,7 +129,7 @@ def _build_genres_df(df, total_tracks):
 
     genres_df = (
         df.groupBy("genres").count()
-        .withColumn("rank",      F.rank().over(w_rank))
+        .withColumn("rank", F.rank().over(w_rank))
         .withColumn("cumul_pct", F.round(
             F.sum("count").over(w_cumul) / total_tracks * 100, 1
         ))
@@ -241,7 +241,7 @@ def _build_zcr_flatness_with_percentile(df):
         )
         .orderBy("count", ascending=False)
         .limit(12)
-        .withColumn("pct_rank_zcr", F.round(F.percent_rank().over(w_zcr),      3))
+        .withColumn("pct_rank_zcr", F.round(F.percent_rank().over(w_zcr), 3))
         .withColumn("pct_rank_flatness", F.round(F.percent_rank().over(w_flatness), 3))
         .withColumn("noise_score", F.round((F.col("pct_rank_zcr") + F.col("pct_rank_flatness")) / 2, 3))
         .toPandas()
@@ -264,7 +264,7 @@ def _build_global_feature_stats(df):
     return df.agg(*agg_exprs).toPandas().iloc[0].to_dict()
 
 
-def predict_genre(track_feats: dict) -> list[tuple[str, float]] | None:
+def predict_genre(track_feats):
     model = load_model()
     if model is None:
         return None
@@ -399,7 +399,7 @@ def show_track_feats(track_feats, feat_stats, stats):
     st.divider()
 
 
-def _render_genre_prediction(track_feats: dict) -> None:
+def _render_genre_prediction(track_feats):
     results = predict_genre(track_feats)
 
     if results is None:
@@ -491,7 +491,7 @@ def _render_bullet_charts(track_feats, feat_stats):
                 st.caption(f"{color} {sign}{delta_pct:.1f}% vs moyenne dataset")
 
 
-def _render_mfcc_radar(track_feats: dict, stats: pd.DataFrame) -> None:
+def _render_mfcc_radar(track_feats, stats):
     st.markdown("#### 🕸️ Profil timbral — ta piste vs genres du dataset")
     st.write(
         "Ton profil MFCC 1–5 (rouge, premier plan) superposé aux "
@@ -530,7 +530,7 @@ def _render_mfcc_radar(track_feats: dict, stats: pd.DataFrame) -> None:
     st.plotly_chart(fig_cmp, use_container_width=True)
 
 
-def _render_chromagram(track_feats: dict) -> None:
+def _render_chromagram(track_feats):
     st.markdown("#### 🎹 Empreinte chromatique de ta piste")
     st.write(
         "Le chromagramme moyen indique quelles notes (C → B) dominent dans ta piste. "
@@ -550,7 +550,7 @@ def _render_chromagram(track_feats: dict) -> None:
     st.plotly_chart(fig_chroma, use_container_width=True)
 
 
-def _render_tonnetz_contrast(track_feats: dict) -> None:
+def _render_tonnetz_contrast(track_feats):
     with st.expander("Détails — Tonnetz & Contrast spectral"):
         t1, t2 = st.columns(2)
 
@@ -579,7 +579,7 @@ def _render_tonnetz_contrast(track_feats: dict) -> None:
             st.plotly_chart(fig_ct, use_container_width=True)
 
 
-def render_track_analysis_section(d: dict) -> None:
+def render_track_analysis_section(d):
     st.divider()
     st.header("Analyse ta propre piste")
     st.divider()
