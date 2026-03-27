@@ -16,7 +16,6 @@ CHANNELS = 1
 MAX_WORKERS = 16
 MAX_RETRIES = 3
 
-# Injected by Cloud Run
 TASK_INDEX = int(os.environ.get("CLOUD_RUN_TASK_INDEX", 0))
 TASK_COUNT = int(os.environ.get("CLOUD_RUN_TASK_COUNT", 1))
 
@@ -91,7 +90,6 @@ def main():
         if mp3_to_wav_blob_name(b) not in existing_wavs
     ]
 
-    # Each task takes its own slice
     my_slice = pending[TASK_INDEX::TASK_COUNT]
     print(f"Task {TASK_INDEX}/{TASK_COUNT}: {len(my_slice)} files to convert")
 
@@ -112,7 +110,7 @@ def main():
         print(f"\n{len(failed)} files failed:")
         for f in failed:
             print(f"  {f}")
-        exit(1)  # non-zero exit so Cloud Run marks the task as failed
+        exit(1)
 
 
 if __name__ == "__main__":

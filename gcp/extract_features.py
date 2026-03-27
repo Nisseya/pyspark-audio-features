@@ -1,8 +1,6 @@
 import os
 import random
 import warnings
-import numpy as np
-import librosa
 import dotenv
 
 dotenv.load_dotenv()
@@ -13,13 +11,13 @@ if os.getenv("CESTQUIQUIADESPROBLEMESAVECSPARK") == "Leo":
     os.environ["HADOOP_HOME"] = r"C:\hadoop"
     os.environ["PATH"] = r"C:\hadoop\bin;" + os.environ["PATH"]
 
-from tqdm import tqdm
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, floor, row_number, sum as Fsum
+from pyspark.sql.functions import col, lit, floor, row_number
 from pyspark.sql.window import Window
 from pyspark.sql.types import StructType, StructField, DoubleType, IntegerType, StringType
 from pyspark.sql.functions import udf
 from datetime import datetime
+import warnings
 
 warnings.filterwarnings("ignore")
 
@@ -105,11 +103,12 @@ schema = StructType(fields)
 def extract_features_compact(path: str):
     import librosa
     import numpy as np
-    import os
     import io
+    import random
     from google.cloud import storage
+    from datetime import datetime
+    from utils.features import _stats_1d, _stats_2d_rows
 
-    # Download from GCS into memory
     clean_path = path.replace("gs://", "")
     bucket_name, blob_name = clean_path.split("/", 1)
 
@@ -121,7 +120,7 @@ def extract_features_compact(path: str):
     try:
         y, sr = librosa.load(buf, sr=None, mono=True)
         if y is None or len(y) < 100:
-            return tuple([0.0] * (len(fields) - 3) + [None, 0.0, 0])
+            return tuple([0.0] * (len(fields) - 5) + [None, 0.0, 0, None, 0])
 
         S = np.abs(librosa.stft(y))
         y_harm = librosa.effects.harmonic(y)
@@ -161,16 +160,12 @@ def extract_features_compact(path: str):
         duration = float(len(y)) / float(sr)
         user_id = random.randint(1, 100)
         uploaded_at = datetime.now().strftime("%Y-%m-%d")
-        
-        out.append(filename)
-        out.append(duration)
-        out.append(user_id)
-        out.append(uploaded_at)
-        out.append(1)
+
+        out += [filename, duration, user_id, uploaded_at, 1]
         return tuple(out)
 
     except Exception:
-        return tuple([0.0] * (len(fields) - 3) + [None, 0.0, 0])
+        return tuple([0.0] * (len(fields) - 5) + [None, 0.0, 0, None, 0])
 
 
 extract_udf = udf(extract_features_compact, schema)
@@ -179,61 +174,27 @@ if __name__ == "__main__":
     BUCKET = "spark-audio-bucket"
     audio_root = f"gs://{BUCKET}/audio/wav"
     out_path = f"gs://{BUCKET}/features/parquet_compact"
+    BATCH_SIZE = 200
 
-    paths_df = (
+    w = Window.orderBy("path")
+
+    (
         spark.read.format("binaryFile")
         .option("pathGlobFilter", "*.wav")
         .option("recursiveFileLookup", "true")
         .load(audio_root)
         .select("path")
         .dropDuplicates(["path"])
+        .withColumn("batch_id", floor((row_number().over(w) - 1) / lit(BATCH_SIZE)).cast("long"))
+        .repartition(8, "batch_id")
+        .withColumn("f", extract_udf(col("path")))
+        .select("path", "batch_id", "f.*")
+        .where(col("ok") == 1)
+        .drop("ok")
+        .write
+        .mode("append")
+        .partitionBy("batch_id")
+        .parquet(out_path)
     )
 
-    BATCH_SIZE = 200
-    w = Window.orderBy("path")
-    paths_df = paths_df.withColumn("rn", row_number().over(w) - 1)
-    paths_df = paths_df.withColumn("batch_id", floor(col("rn") / lit(BATCH_SIZE)).cast("long")).drop("rn")
-
-    batch_ids = [r["batch_id"] for r in paths_df.select("batch_id").distinct().orderBy("batch_id").collect()]
-    print("BATCHES:", len(batch_ids), "| BATCH_SIZE:", BATCH_SIZE)
-
-    spark._jsc.hadoopConfiguration().set("parquet.enable.summary-metadata", "false")
-
-    ok_total = 0
-    ko_total = 0
-
-    for bid in tqdm(batch_ids, desc="Batches", unit="batch"):
-        batch = paths_df.filter(col("batch_id") == lit(bid)).repartition(8)
-        if batch.rdd.isEmpty():
-            continue
-
-        feat_df = (
-            batch
-            .withColumn("f", extract_udf(col("path")))
-            .select("path", "batch_id", "f.*")
-        )
-
-        c = feat_df.select(
-            Fsum(col("ok")).alias("ok"),
-            Fsum((1 - col("ok"))).alias("ko")
-        ).collect()[0]
-
-        ok_b = int(c["ok"])
-        ko_b = int(c["ko"])
-        ok_total += ok_b
-        ko_total += ko_b
-
-        (
-            feat_df
-            .where(col("ok") == 1)
-            .drop("ok")
-            .write
-            .mode("append")
-            .partitionBy("batch_id")
-            .parquet(out_path)
-        )
-
-        tqdm.write(f"batch={bid} ok={ok_b} ko={ko_b} | cumul ok={ok_total} ko={ko_total}")
-
-    print("DONE | OK:", ok_total, "KO:", ko_total)
     spark.stop()
