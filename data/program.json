@@ -1,0 +1,14 @@
+[
+  {
+    "title": "Opening Session",
+    "speaker": "Alice Martin",
+    "time": "09:00",
+    "location": "Main Hall"
+  },
+  {
+    "title": "AI Workshop",
+    "speaker": "Bob Chen",
+    "time": "10:30",
+    "location": "Room B"
+  }
+]
