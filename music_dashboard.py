@@ -44,10 +44,14 @@ COLORS = px.colors.qualitative.D3
 
 @st.cache_resource
 def get_spark():
-    spark = SparkSession.builder.getOrCreate()
-    spark.sparkContext.setLogLevel("ERROR")
+    spark = (
+        SparkSession.builder
+        .appName("music-dashboard")
+        .config("spark.network.timeout", "300s")
+        .config("spark.executor.heartbeatInterval", "60s")
+        .getOrCreate()
+    )
     return spark
-
 
 @st.cache_resource
 def load_raw():
@@ -129,7 +133,7 @@ def _build_genres_df(df, total_tracks):
 
     genres_df = (
         df.groupBy("genres").count()
-        .withColumn("rank",      F.rank().over(w_rank))
+        .withColumn("rank", F.rank().over(w_rank))
         .withColumn("cumul_pct", F.round(
             F.sum("count").over(w_cumul) / total_tracks * 100, 1
         ))
@@ -241,7 +245,7 @@ def _build_zcr_flatness_with_percentile(df):
         )
         .orderBy("count", ascending=False)
         .limit(12)
-        .withColumn("pct_rank_zcr", F.round(F.percent_rank().over(w_zcr),      3))
+        .withColumn("pct_rank_zcr", F.round(F.percent_rank().over(w_zcr), 3))
         .withColumn("pct_rank_flatness", F.round(F.percent_rank().over(w_flatness), 3))
         .withColumn("noise_score", F.round((F.col("pct_rank_zcr") + F.col("pct_rank_flatness")) / 2, 3))
         .toPandas()
@@ -264,7 +268,7 @@ def _build_global_feature_stats(df):
     return df.agg(*agg_exprs).toPandas().iloc[0].to_dict()
 
 
-def predict_genre(track_feats: dict) -> list[tuple[str, float]] | None:
+def predict_genre(track_feats):
     model = load_model()
     if model is None:
         return None
@@ -399,7 +403,7 @@ def show_track_feats(track_feats, feat_stats, stats):
     st.divider()
 
 
-def _render_genre_prediction(track_feats: dict) -> None:
+def _render_genre_prediction(track_feats):
     results = predict_genre(track_feats)
 
     if results is None:
@@ -491,7 +495,7 @@ def _render_bullet_charts(track_feats, feat_stats):
                 st.caption(f"{color} {sign}{delta_pct:.1f}% vs moyenne dataset")
 
 
-def _render_mfcc_radar(track_feats: dict, stats: pd.DataFrame) -> None:
+def _render_mfcc_radar(track_feats, stats):
     st.markdown("#### 🕸️ Profil timbral — ta piste vs genres du dataset")
     st.write(
         "Ton profil MFCC 1–5 (rouge, premier plan) superposé aux "
@@ -530,7 +534,7 @@ def _render_mfcc_radar(track_feats: dict, stats: pd.DataFrame) -> None:
     st.plotly_chart(fig_cmp, use_container_width=True)
 
 
-def _render_chromagram(track_feats: dict) -> None:
+def _render_chromagram(track_feats):
     st.markdown("#### 🎹 Empreinte chromatique de ta piste")
     st.write(
         "Le chromagramme moyen indique quelles notes (C → B) dominent dans ta piste. "
@@ -550,7 +554,7 @@ def _render_chromagram(track_feats: dict) -> None:
     st.plotly_chart(fig_chroma, use_container_width=True)
 
 
-def _render_tonnetz_contrast(track_feats: dict) -> None:
+def _render_tonnetz_contrast(track_feats):
     with st.expander("Détails — Tonnetz & Contrast spectral"):
         t1, t2 = st.columns(2)
 
@@ -579,7 +583,7 @@ def _render_tonnetz_contrast(track_feats: dict) -> None:
             st.plotly_chart(fig_ct, use_container_width=True)
 
 
-def render_track_analysis_section(d: dict) -> None:
+def render_track_analysis_section(d):
     st.divider()
     st.header("Analyse ta propre piste")
     st.divider()
@@ -710,8 +714,8 @@ def _render_history_section(d):
         )
         show_track_feats(track_feats, d["feature_stats"], d["stats"])
 
-
 def _analyse_single_track(path, music_name):
+    print("START analyse:", path)
     spark = get_spark()
     abs_path = os.path.abspath(path)
     file_uri = f"file://{abs_path}"
@@ -722,18 +726,17 @@ def _analyse_single_track(path, music_name):
         .select("f.*")
         .withColumn("filename", F.lit(music_name or "Unknown Track"))
     )
-
+    
     feat_df.write.mode("append").parquet("data/features/history_features")
 
-    result_df = feat_df.toPandas()
-    if result_df.empty or int(result_df.iloc[0]["ok"]) != 1:
+    row = feat_df.limit(1).toPandas()
+    if row is None or int(row["ok"]) != 1:
         st.error("L'UDF Spark a retourné ok=0 — vérifiez librosa.")
         return None
 
-    result = result_df.iloc[0].to_dict()
+    result = row.iloc[0].to_dict()
     result.pop("ok", None)
     return result
-
 
 def render_global_stats_section(d):
     st.header("Statistiques globales du dataset")
