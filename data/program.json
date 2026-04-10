@@ -1,14 +1,44 @@
 [
   {
-    "title": "Opening Session",
-    "speaker": "Alice Martin",
+    "title": "Opening Ceremony",
+    "speaker": "Yassine Hadi",
     "time": "09:00",
     "location": "Main Hall"
   },
   {
-    "title": "AI Workshop",
-    "speaker": "Bob Chen",
-    "time": "10:30",
+    "title": "AI & Data Trends 2026",
+    "speaker": "Sarah Dupont",
+    "time": "10:00",
+    "location": "Room A"
+  },
+  {
+    "title": "Coffee Break",
+    "speaker": "",
+    "time": "11:00",
+    "location": "Lounge"
+  },
+  {
+    "title": "Hands-on Workshop: LLMs",
+    "speaker": "Oussama Boukerma",
+    "time": "11:30",
     "location": "Room B"
+  },
+  {
+    "title": "Lunch",
+    "speaker": "",
+    "time": "13:00",
+    "location": "Cafeteria"
+  },
+  {
+    "title": "Startup Pitch Session",
+    "speaker": "Multiple Speakers",
+    "time": "14:30",
+    "location": "Main Hall"
+  },
+  {
+    "title": "Closing Talk",
+    "speaker": "John Smith",
+    "time": "16:00",
+    "location": "Main Hall"
   }
 ]
